@@ -8,8 +8,8 @@ from pathlib import Path
 
 import torch
 
-from budget_features import build_budget_features, split_sentences, features_to_vector
-from budget_model import BudgetConfig, BudgetPredictorMLP, class_to_ratio
+from target_ratio_model.budget_features import build_budget_features, split_sentences, features_to_vector
+from target_ratio_model.budget_model import BudgetConfig, BudgetPredictorMLP, class_to_ratio
 
 
 class LearnedBudgetSelector:

@@ -8,8 +8,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from budget_features import FEATURE_ORDER, build_budget_features, features_to_vector
-from budget_model import BudgetConfig, BudgetLoss, BudgetPredictorMLP, build_metadata, ratio_to_class
+from target_ratio_model.budget_features import FEATURE_ORDER, build_budget_features, features_to_vector
+from target_ratio_model.budget_model import (
+    BudgetConfig,
+    BudgetLoss,
+    BudgetPredictorMLP,
+    build_metadata,
+    ratio_to_class,
+)
 
 
 DEFAULT_BUCKETS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
@@ -40,8 +46,8 @@ def build_dataset(samples: List[dict], ratio_buckets: List[float]):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_file", type=str, required=True,default='sample_budget_train.jsonl')
-    parser.add_argument("--output_dir", type=str, required=True,default='outputs')
+    parser.add_argument("--train_file", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)

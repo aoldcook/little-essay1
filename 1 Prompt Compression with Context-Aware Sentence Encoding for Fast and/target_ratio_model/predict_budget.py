@@ -4,8 +4,8 @@ from pathlib import Path
 
 import torch
 
-from budget_features import FEATURE_ORDER, build_budget_features, features_to_vector
-from budget_model import BudgetConfig, BudgetPredictorMLP, class_to_ratio
+from target_ratio_model.budget_features import FEATURE_ORDER, build_budget_features, features_to_vector
+from target_ratio_model.budget_model import BudgetConfig, BudgetPredictorMLP, class_to_ratio
 
 
 def load_json(path: Path):
@@ -15,8 +15,8 @@ def load_json(path: Path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", type=str, required=True,default='outputs')
-    parser.add_argument("--input_json", type=str, required=True,default='predict_input_example.json')
+    parser.add_argument("--model_dir", type=str, required=True)
+    parser.add_argument("--input_json", type=str, required=True)
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
