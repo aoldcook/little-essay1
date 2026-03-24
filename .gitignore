@@ -1,3 +1,9 @@
 *.safetensors
 __pycache__/
 *.pyc
+# Local artifacts
+**/outputs_mntp/
+**/outputs_demo/
+**/sample_span_pseudo.jsonl
+**/cleaned_test/
+tmp_*.txt
