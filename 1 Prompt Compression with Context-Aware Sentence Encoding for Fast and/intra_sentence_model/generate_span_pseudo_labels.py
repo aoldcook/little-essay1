@@ -9,7 +9,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import argparse
 import json
-from typing import Iterable, List, Optional, Sequence
+import torch
+from dataclasses import dataclass
+from typing import Iterable, List, Sequence
 
 from context_aware_encoder_model.context_aware_sentence_encoder import (
     ContextAwareEncoderConfig,
@@ -20,11 +22,46 @@ from intra_sentence_model.span_feature_utils import (
     build_span_feature_dict,
     detect_question_type,
     normalize_scores,
-    overlap_ratio,
     query_overlap_score,
     tokenize_mixed,
 )
 from pipeline.task_aware_compression import DynamicSpanCompressor, IntraSentenceCompressionConfig
+
+
+@dataclass
+class TrainingSentence:
+    text: str
+    role: str
+    sentence_score: float
+
+
+class LightweightTokenizer:
+    is_fast = False
+    mask_token_id = None
+    all_special_ids: List[int] = []
+
+    def tokenize(self, text: str) -> List[str]:
+        return tokenize_mixed(text)
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return abs(hash(token)) % 100000
+
+
+class LightweightSentenceEncoder:
+    def __init__(self, max_length: int = 1024):
+        self.tokenizer = LightweightTokenizer()
+        self.encoder = None
+        self.device = torch.device("cpu")
+        self.config = type(
+            "LightweightEncoderConfig",
+            (),
+            {
+                "model_name": "lightweight_lexical_fallback",
+                "max_length": max_length,
+                "cache_dir": "",
+                "trust_remote_code": False,
+            },
+        )()
 
 
 def load_jsonl(path: Path) -> List[dict]:
@@ -41,6 +78,25 @@ def save_jsonl(path: Path, rows: Iterable[dict]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def load_existing_example_ids(path: Path) -> set[str]:
+    existing_ids: set[str] = set()
+    if not path.exists():
+        return existing_ids
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            example_id = str(row.get("example_id", "")).strip()
+            if example_id:
+                existing_ids.add(example_id)
+    return existing_ids
 
 
 def split_sentences(text: str) -> List[str]:
@@ -69,6 +125,21 @@ def char_f1(pred: str, ref: str) -> float:
     return 2 * precision * recall / max(precision + recall, 1e-12)
 
 
+def token_recall(reference: str, candidate: str) -> float:
+    ref_toks = set(tokenize_mixed(reference))
+    if not ref_toks:
+        return 0.0
+    cand_toks = set(tokenize_mixed(candidate))
+    return len(ref_toks & cand_toks) / max(len(ref_toks), 1)
+
+
+def average_token_recall(references: Sequence[str], candidate: str) -> float:
+    scores = [token_recall(ref, candidate) for ref in references if str(ref).strip()]
+    if not scores:
+        return 0.0
+    return float(sum(scores) / len(scores))
+
+
 def extractive_demo_answer(question: str, context: str) -> str:
     sentences = split_sentences(context)
     if not sentences:
@@ -87,6 +158,9 @@ def compute_answer_quality(question: str, context: str, answer: str) -> float:
 
 
 def load_encoder_from_dir(encoder_dir: str, device: str) -> ContextAwareSentenceEncoder:
+    if encoder_dir == "lightweight_lexical_fallback":
+        return LightweightSentenceEncoder()
+
     encoder_dir_path = Path(encoder_dir)
     cfg_dict = json.loads((encoder_dir_path / "encoder_config.json").read_text(encoding="utf-8"))
     cfg_dict["device"] = device
@@ -102,11 +176,11 @@ def load_encoder_from_dir(encoder_dir: str, device: str) -> ContextAwareSentence
     return model
 
 
-def pick_training_sentences(row: dict) -> List[str]:
+def pick_training_sentences(row: dict, include_negative_sentences: bool, max_negative_training_sentences: int) -> List[TrainingSentence]:
     context = row.get("context", "")
     context_sentences = split_sentences(context)
     seen = set()
-    out = []
+    out: List[TrainingSentence] = []
     for sentence in row.get("supporting_sentences", []) or []:
         sentence = str(sentence).strip()
         if not sentence:
@@ -117,14 +191,48 @@ def pick_training_sentences(row: dict) -> List[str]:
         if key in seen:
             continue
         seen.add(key)
-        out.append(sentence)
+        out.append(TrainingSentence(sentence, "supporting", 0.72))
     positive = str(row.get("positive_sentence", "")).strip()
     if positive and positive in context_sentences and positive not in seen:
-        out.append(positive)
+        out.append(TrainingSentence(positive, "positive", 0.78))
+
+    if include_negative_sentences:
+        negative_count = 0
+        for sentence in row.get("negative_sentences", []) or []:
+            sentence = str(sentence).strip()
+            if not sentence:
+                continue
+            if sentence not in context_sentences:
+                continue
+            key = sentence.strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(TrainingSentence(sentence, "negative", 0.22))
+            negative_count += 1
+            if negative_count >= max_negative_training_sentences:
+                break
     return out
 
 
-def build_pseudo_label(
+def is_hard_keep_span(question: str, question_type: str, answer: str, span_text: str, feature_dict: dict, qa_feedback_drop: float) -> bool:
+    if qa_feedback_drop >= 0.12:
+        return True
+    if feature_dict["answer_overlap"] >= 0.30:
+        return True
+    if feature_dict["query_overlap"] >= 0.40:
+        return True
+    if question_type in {"numeric", "factoid"} and feature_dict["answer_overlap"] > 0.0:
+        return True
+    if question_type == "numeric" and any(ch.isdigit() for ch in span_text):
+        answer_has_number = any(ch.isdigit() for ch in answer)
+        question_has_number_hint = any(hint in question.lower() for hint in ("how many", "how much", "number", "percent", "value", "year"))
+        if answer_has_number or question_has_number_hint:
+            return True
+    return False
+
+
+def build_heuristic_pseudo_label(
     span,
     feature_dict: dict,
     answer_drop: float,
@@ -148,14 +256,89 @@ def build_pseudo_label(
     return label, float(score)
 
 
+def build_feedback_pseudo_label(
+    question: str,
+    question_type: str,
+    answer: str,
+    role: str,
+    span,
+    feature_dict: dict,
+    answer_drop: float,
+    support_drop: float,
+    sentence_drop: float,
+) -> tuple[int, float, dict]:
+    qa_feedback_drop = max(answer_drop, support_drop, sentence_drop)
+    keep_score = (
+        0.34 * qa_feedback_drop
+        + 0.20 * feature_dict["answer_overlap"]
+        + 0.16 * feature_dict["query_overlap"]
+        + 0.12 * feature_dict["anchor_score"]
+        + 0.10 * feature_dict["task_reward"]
+        + 0.04 * feature_dict["attention_score"]
+        + 0.04 * feature_dict["dac_score"]
+    )
+    if role == "negative":
+        keep_score -= 0.22
+    if role == "positive":
+        keep_score += 0.05
+    elif role == "supporting":
+        keep_score += 0.03
+
+    if span.kind == "source_attribution":
+        keep_score -= 0.22
+    elif span.kind == "background_lead":
+        keep_score -= 0.18
+    elif span.kind == "parenthetical":
+        keep_score -= 0.16
+    elif span.kind == "tail":
+        keep_score -= 0.10
+    elif span.kind == "example" and qa_feedback_drop < 0.08:
+        keep_score -= 0.08
+
+    hard_keep = is_hard_keep_span(question, question_type, answer, span.text, feature_dict, qa_feedback_drop)
+    weak_redundant = (
+        qa_feedback_drop < 0.04
+        and feature_dict["answer_overlap"] == 0.0
+        and feature_dict["query_overlap"] < 0.20
+        and feature_dict["anchor_score"] < 0.45
+    )
+    if role == "negative" and not hard_keep:
+        label = 0
+    elif hard_keep:
+        label = 1
+    elif weak_redundant:
+        label = 0
+    else:
+        label = 1 if keep_score >= 0.34 else 0
+
+    feedback = {
+        "qa_feedback_drop": float(qa_feedback_drop),
+        "answer_drop": float(answer_drop),
+        "support_drop": float(support_drop),
+        "sentence_drop": float(sentence_drop),
+        "hard_keep": bool(hard_keep),
+        "weak_redundant": bool(weak_redundant),
+    }
+    return label, float(keep_score), feedback
+
+
+def build_example_id(source_id: str, sent_idx: int) -> str:
+    return f"{source_id}::{sent_idx}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_file", type=str, required=True)
     parser.add_argument("--output_file", type=str, required=True)
     parser.add_argument("--encoder_dir", type=str, required=True)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--default_keep_ratio", type=float, default=0.78)
-    parser.add_argument("--min_sentence_chars", type=int, default=18)
+    parser.add_argument("--default_keep_ratio", type=float, default=0.52)
+    parser.add_argument("--min_sentence_chars", type=int, default=45)
+    parser.add_argument("--include_negative_sentences", action="store_true")
+    parser.add_argument("--max_negative_training_sentences", type=int, default=2)
+    parser.add_argument("--label_policy", choices=["heuristic", "feedback"], default="heuristic")
+    parser.add_argument("--log_every", type=int, default=500)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     rows = load_jsonl(Path(args.input_file))
@@ -168,86 +351,149 @@ def main() -> None:
         ),
     )
 
-    output_rows = []
-    for row_idx, row in enumerate(rows):
-        question = str(row.get("question", "")).strip()
-        context = str(row.get("context", "")).strip()
-        answer = str(row.get("answer", "")).strip()
-        if not question or not context:
-            continue
+    output_path = Path(args.output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_ids = load_existing_example_ids(output_path) if args.resume else set()
+    mode = "a" if args.resume and output_path.exists() else "w"
+    initial_examples = len(existing_ids)
+    written_examples = 0
 
-        candidate_sentences = pick_training_sentences(row)
-        if not candidate_sentences:
-            continue
-
-        question_type = str(row.get("question_type", "")).strip() or detect_question_type(question)
-        base_answer_quality = compute_answer_quality(question, context, answer)
-
-        for sent_idx, sentence in enumerate(candidate_sentences):
-            if len(sentence.strip()) < args.min_sentence_chars:
-                continue
-
-            spans = compressor.split_sentence_into_spans(question, sentence, question_type)
-            if len(spans) < 2:
-                continue
-
-            attention_scores = normalize_scores(compressor.compute_span_attention_scores(question, spans))
-            dac_scores = normalize_scores(compressor.compute_dac_span_scores(question, spans))
-            if not attention_scores:
-                attention_scores = [0.0 for _ in spans]
-            if not dac_scores:
-                dac_scores = [0.0 for _ in spans]
-
-            span_rows = []
-            sentence_score = float(row.get("sentence_score", 0.75 if sentence == row.get("positive_sentence") else 0.68))
-            keep_ratio = float(row.get("keep_ratio", args.default_keep_ratio))
-            sentence_length = max(len(sentence), 1)
-            sentence_token_len = max(len(tokenize_mixed(sentence)), 1)
-
-            for span_index, span in enumerate(spans):
-                pruned_sentence = compressor.cleanup_sentence(sentence[: span.start] + sentence[span.end :], sentence)
-                modified_context = context.replace(sentence, pruned_sentence, 1)
-                removal_quality = compute_answer_quality(question, modified_context, answer)
-                answer_drop = max(0.0, base_answer_quality - removal_quality)
-                answer_overlap = answer_overlap_score(answer, span.text)
-                feature_dict = build_span_feature_dict(
-                    question=question,
-                    span_text=span.text,
-                    span_kind=span.kind,
-                    span_index=span_index,
-                    num_spans=len(spans),
-                    sentence_length=sentence_length,
-                    sentence_token_length=sentence_token_len,
-                    start=span.start,
-                    end=span.end,
-                    sentence_score=sentence_score,
-                    keep_ratio=keep_ratio,
-                    question_type=question_type,
-                    attention_score=attention_scores[span_index],
-                    dac_score=dac_scores[span_index],
-                    answer_overlap=answer_overlap,
-                    answer_drop=answer_drop,
-                    protected=span.protected,
-                )
-                label, pseudo_keep_score = build_pseudo_label(span, feature_dict, answer_drop)
-                span_rows.append(
-                    {
-                        "text": span.text,
-                        "start": span.start,
-                        "end": span.end,
-                        "kind": span.kind,
-                        "protected": span.protected,
-                        "answer_overlap": answer_overlap,
-                        "answer_drop": answer_drop,
-                        "pseudo_keep_score": pseudo_keep_score,
-                        "label": label,
-                        "features": feature_dict,
-                    }
+    with output_path.open(mode, encoding="utf-8") as out_f:
+        for row_idx, row in enumerate(rows):
+            if args.log_every > 0 and row_idx > 0 and row_idx % args.log_every == 0:
+                print(
+                    f"processed_rows={row_idx}/{len(rows)} pseudo_sentence_examples={initial_examples + written_examples}",
+                    flush=True,
                 )
 
-            output_rows.append(
-                {
-                    "source_id": row.get("id", f"row_{row_idx:06d}"),
+            question = str(row.get("question", "")).strip()
+            context = str(row.get("context", "")).strip()
+            answer = str(row.get("answer", "")).strip()
+            if not question or not context:
+                continue
+
+            candidate_sentences = pick_training_sentences(
+                row,
+                include_negative_sentences=args.include_negative_sentences,
+                max_negative_training_sentences=args.max_negative_training_sentences,
+            )
+            if not candidate_sentences:
+                continue
+
+            question_type = str(row.get("question_type", "")).strip() or detect_question_type(question)
+            base_answer_quality = compute_answer_quality(question, context, answer)
+            source_id = str(row.get("id", f"row_{row_idx:06d}"))
+
+            support_refs = [str(item).strip() for item in (row.get("supporting_sentences", []) or []) if str(item).strip()]
+            positive_ref = str(row.get("positive_sentence", "")).strip()
+            if positive_ref:
+                support_refs.append(positive_ref)
+            base_support_recall = average_token_recall(support_refs, context)
+
+            for sent_idx, training_sentence in enumerate(candidate_sentences):
+                sentence = training_sentence.text
+                example_id = build_example_id(source_id, sent_idx)
+                if example_id in existing_ids:
+                    continue
+                if len(sentence.strip()) < args.min_sentence_chars:
+                    continue
+
+                spans = compressor.split_sentence_into_spans(question, sentence, question_type)
+                spans = compressor.refine_long_spans(question, spans, question_type)
+                spans = compressor.apply_evidence_list_floor(question, spans, question_type)
+                if len(spans) < 2:
+                    continue
+
+                attention_scores = normalize_scores(compressor.compute_span_attention_scores(question, spans))
+                dac_scores = normalize_scores(compressor.compute_dac_span_scores(question, spans))
+                if not attention_scores:
+                    attention_scores = [0.0 for _ in spans]
+                if not dac_scores:
+                    dac_scores = [0.0 for _ in spans]
+
+                span_rows = []
+                sentence_score = float(row.get("sentence_score", training_sentence.sentence_score))
+                keep_ratio = float(row.get("keep_ratio", args.default_keep_ratio))
+                sentence_length = max(len(sentence), 1)
+                sentence_token_len = max(len(tokenize_mixed(sentence)), 1)
+                base_sentence_recall = token_recall(sentence, context)
+
+                for span_index, span in enumerate(spans):
+                    pruned_sentence = compressor.cleanup_sentence(sentence[: span.start] + sentence[span.end :], sentence)
+                    modified_context = context.replace(sentence, pruned_sentence, 1)
+                    removal_quality = compute_answer_quality(question, modified_context, answer)
+                    answer_drop = max(0.0, base_answer_quality - removal_quality)
+                    answer_recall_drop = max(0.0, token_recall(answer, context) - token_recall(answer, modified_context)) if answer else 0.0
+                    support_drop = max(0.0, base_support_recall - average_token_recall(support_refs, modified_context))
+                    sentence_drop = max(0.0, base_sentence_recall - token_recall(sentence, modified_context))
+                    answer_overlap = answer_overlap_score(answer, span.text)
+                    feature_dict = build_span_feature_dict(
+                        question=question,
+                        span_text=span.text,
+                        span_kind=span.kind,
+                        span_index=span_index,
+                        num_spans=len(spans),
+                        sentence_length=sentence_length,
+                        sentence_token_length=sentence_token_len,
+                        start=span.start,
+                        end=span.end,
+                        sentence_score=sentence_score,
+                        keep_ratio=keep_ratio,
+                        question_type=question_type,
+                        attention_score=attention_scores[span_index],
+                        dac_score=dac_scores[span_index],
+                        answer_overlap=answer_overlap,
+                        answer_drop=max(answer_drop, answer_recall_drop),
+                        protected=span.protected,
+                    )
+                    heuristic_label, heuristic_score = build_heuristic_pseudo_label(span, feature_dict, answer_drop)
+                    if args.label_policy == "feedback":
+                        label, pseudo_keep_score, feedback = build_feedback_pseudo_label(
+                            question=question,
+                            question_type=question_type,
+                            answer=answer,
+                            role=training_sentence.role,
+                            span=span,
+                            feature_dict=feature_dict,
+                            answer_drop=max(answer_drop, answer_recall_drop),
+                            support_drop=support_drop,
+                            sentence_drop=sentence_drop,
+                        )
+                    else:
+                        label, pseudo_keep_score = heuristic_label, heuristic_score
+                        feedback = {
+                            "qa_feedback_drop": float(max(answer_drop, answer_recall_drop, support_drop, sentence_drop)),
+                            "answer_drop": float(max(answer_drop, answer_recall_drop)),
+                            "support_drop": float(support_drop),
+                            "sentence_drop": float(sentence_drop),
+                            "hard_keep": False,
+                            "weak_redundant": False,
+                        }
+                    span_rows.append(
+                        {
+                            "text": span.text,
+                            "start": span.start,
+                            "end": span.end,
+                            "kind": span.kind,
+                            "protected": span.protected,
+                            "answer_overlap": answer_overlap,
+                            "answer_drop": max(answer_drop, answer_recall_drop),
+                            "support_drop": support_drop,
+                            "sentence_drop": sentence_drop,
+                            "qa_feedback_drop": feedback["qa_feedback_drop"],
+                            "heuristic_label": heuristic_label,
+                            "hard_disagreement": bool(label != heuristic_label),
+                            "hard_keep": feedback["hard_keep"],
+                            "weak_redundant": feedback["weak_redundant"],
+                            "pseudo_keep_score": pseudo_keep_score,
+                            "label": label,
+                            "features": feature_dict,
+                        }
+                    )
+
+                output_row = {
+                    "example_id": example_id,
+                    "source_id": source_id,
                     "question": question,
                     "context": context,
                     "selected_sentence": sentence,
@@ -257,14 +503,21 @@ def main() -> None:
                     "answer": answer,
                     "base_answer_quality": base_answer_quality,
                     "spans": span_rows,
-                    "source_role": "positive" if sentence == row.get("positive_sentence") else "supporting",
+                    "source_role": training_sentence.role,
                     "selected_sentence_index": sent_idx,
+                    "label_policy": args.label_policy,
                 }
-            )
+                out_f.write(json.dumps(output_row, ensure_ascii=False) + "\n")
+                written_examples += 1
+                existing_ids.add(example_id)
 
-    save_jsonl(Path(args.output_file), output_rows)
+                if args.log_every > 0 and written_examples % max(args.log_every, 1) == 0:
+                    out_f.flush()
+
+        out_f.flush()
+
     print(f"saved pseudo labels: {args.output_file}")
-    print(f"num_sentence_examples: {len(output_rows)}")
+    print(f"num_sentence_examples: {initial_examples + written_examples}")
 
 
 if __name__ == "__main__":

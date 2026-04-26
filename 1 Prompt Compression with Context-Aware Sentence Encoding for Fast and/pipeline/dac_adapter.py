@@ -31,16 +31,31 @@ class DacTokenAdapter:
         self.available = False
         self.entropy_model = None
 
-        try:
-            self.entropy_model = AutoModelForMaskedLM.from_pretrained(
-                sentence_encoder.config.model_name,
-                attn_implementation="eager",
-            ).to(self.device)
-            self.entropy_model.eval()
-            self.available = self.tokenizer.mask_token_id is not None
-        except Exception:
-            self.entropy_model = None
-            self.available = False
+        if self.tokenizer.mask_token_id is not None:
+            try:
+                self.entropy_model = AutoModelForMaskedLM.from_pretrained(
+                    sentence_encoder.config.model_name,
+                    cache_dir=getattr(sentence_encoder.config, "cache_dir", "") or None,
+                    trust_remote_code=getattr(sentence_encoder.config, "trust_remote_code", True),
+                    attn_implementation="eager",
+                ).to(self.device)
+                self.entropy_model.eval()
+                self.available = True
+            except TypeError:
+                try:
+                    self.entropy_model = AutoModelForMaskedLM.from_pretrained(
+                        sentence_encoder.config.model_name,
+                        cache_dir=getattr(sentence_encoder.config, "cache_dir", "") or None,
+                        trust_remote_code=getattr(sentence_encoder.config, "trust_remote_code", True),
+                    ).to(self.device)
+                    self.entropy_model.eval()
+                    self.available = True
+                except Exception:
+                    self.entropy_model = None
+                    self.available = False
+            except Exception:
+                self.entropy_model = None
+                self.available = False
 
     def normalize(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.dim() == 0:
@@ -121,8 +136,9 @@ class DacTokenAdapter:
             return None
 
         try:
+            encoded_question = self.sentence_encoder.format_query(question) if hasattr(self.sentence_encoder, "format_query") else question
             batch = self.tokenizer(
-                question,
+                encoded_question,
                 text,
                 truncation=True,
                 max_length=self.max_length,
@@ -341,4 +357,6 @@ class DacTokenAdapter:
             "fusion": self.config.fusion,
             "alpha": self.config.alpha,
         }
+
+
 

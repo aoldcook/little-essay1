@@ -13,95 +13,146 @@ from pipeline.dac_adapter import DacTokenAdapter
 
 
 QUESTION_STOPWORDS = {
-    "\u4ec0\u4e48",
-    "\u4e3a\u4f55",
-    "\u4e3a\u4ec0\u4e48",
-    "\u5982\u4f55",
-    "\u600e\u4e48",
-    "\u54ea\u4e9b",
-    "\u54ea\u4e2a",
-    "\u591a\u5c11",
-    "\u662f\u5426",
-    "\u4ee5\u53ca",
-    "\u8fd9\u4e2a",
-    "\u90a3\u4e2a",
-    "\u4e00\u79cd",
-    "\u5173\u4e8e",
-    "\u8bf7\u95ee",
-    "the",
     "a",
     "an",
-    "of",
-    "for",
-    "to",
-    "in",
-    "on",
-    "with",
     "and",
-    "or",
-    "is",
     "are",
-    "what",
-    "why",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "could",
+    "do",
+    "does",
+    "did",
+    "for",
+    "from",
     "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "should",
+    "that",
+    "the",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
 }
-
 CAUSE_HINTS = (
-    "\u56e0\u4e3a",
-    "\u539f\u56e0",
-    "\u5bfc\u81f4",
-    "\u56e0\u6b64",
-    "\u6240\u4ee5",
-    "\u7531\u4e8e",
-    "\u673a\u5236",
-    "\u4f7f\u5f97",
     "because",
+    "cause",
+    "caused",
+    "causes",
+    "consequence",
+    "consequences",
     "due to",
+    "effect",
+    "effects",
+    "impact",
+    "impacts",
+    "lead to",
+    "leads to",
+    "mechanism",
+    "result",
+    "results",
+    "risk",
+    "risks",
     "therefore",
+    "trigger",
+    "triggers",
 )
 COMPARISON_HINTS = (
-    "\u6bd4\u8f83",
-    "\u533a\u522b",
-    "\u4e0d\u540c",
-    "\u76f8\u6bd4",
-    "\u4f18\u4e8e",
-    "\u52a3\u4e8e",
-    "\u66f4",
+    "better",
+    "compared",
+    "comparison",
+    "contrast",
+    "differ",
+    "difference",
+    "different",
     "less",
     "more",
     "than",
     "versus",
+    "vs",
+    "whereas",
+    "while",
 )
 PROCEDURE_HINTS = (
-    "\u6b65\u9aa4",
-    "\u6d41\u7a0b",
-    "\u9996\u5148",
-    "\u7136\u540e",
-    "\u63a5\u7740",
-    "\u6700\u540e",
-    "first",
-    "then",
-    "next",
+    "after",
+    "before",
     "finally",
+    "first",
+    "method",
+    "next",
+    "process",
+    "second",
+    "step",
+    "steps",
+    "then",
+    "workflow",
 )
-NUMERIC_HINTS = ("\u591a\u5c11", "\u51e0", "\u6570\u503c", "\u6bd4\u4f8b", "\u53c2\u6570", "percent", "rate")
+NUMERIC_HINTS = (
+    "amount",
+    "average",
+    "count",
+    "how many",
+    "how much",
+    "number",
+    "percent",
+    "percentage",
+    "rate",
+    "ratio",
+    "threshold",
+    "value",
+)
 FACTOID_HINTS = (
-    "\u8c01",
-    "\u4f55\u65f6",
-    "\u54ea\u91cc",
-    "\u54ea\u4e00",
-    "\u65f6\u95f4",
-    "\u5730\u70b9",
+    "city",
+    "country",
+    "date",
+    "location",
+    "name",
+    "person",
+    "place",
+    "time",
     "when",
     "where",
+    "which",
     "who",
 )
-NEGATION_HINTS = ("\u4e0d", "\u6ca1", "\u65e0", "\u5e76\u975e", "\u4e0d\u662f", "cannot", "not", "without", "never")
-EXAMPLE_HINTS = ("\u4f8b\u5982", "\u6bd4\u5982", "\u4e3e\u4f8b", "for example", "such as", "e.g.")
-BOUNDARY_CHARS = set("\uff0c,\uff1b;\uff1a:\u3002\uff01\uff1f!?")
-OPEN_BRACKETS = "([\uff08\u3010"
-CLOSE_BRACKETS = ")]\uff09\u3011"
+NEGATION_HINTS = ("cannot", "except", "lack", "lacks", "neither", "never", "no", "not", "without")
+EXAMPLE_HINTS = ("e.g.", "example", "examples", "for example", "for instance", "such as")
+OUTCOME_HINTS = ("consequence", "effect", "impact", "outcome", "result", "risk", "trigger")
+EXPLANATORY_EVIDENCE_HINTS = (
+    "decline",
+    "evidence",
+    "example",
+    "examples",
+    "include",
+    "includes",
+    "loss",
+    "release",
+    "releases",
+    "risk",
+    "risks",
+    "severe",
+    "stress",
+)
+BOUNDARY_CHARS = set(",;:")
+OPEN_BRACKETS = "([{"
+CLOSE_BRACKETS = ")]}"
 COMPLEX_QTYPES = {"cause", "comparison", "procedure"}
+TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*|\d+(?:\.\d+)?%?")
 
 
 def normalize_scores(values: Sequence[float]) -> List[float]:
@@ -114,26 +165,46 @@ def normalize_scores(values: Sequence[float]) -> List[float]:
     return norm.tolist()
 
 
+def normalize_term(term: str) -> str:
+    term = term.lower().strip("'\"")
+    if len(term) > 4 and term.endswith("ies"):
+        return term[:-3] + "y"
+    for suffix in ("ing", "ed", "es", "s"):
+        if len(term) > len(suffix) + 3 and term.endswith(suffix):
+            return term[: -len(suffix)]
+    return term
+
+
+def contains_any(text: str, hints: Sequence[str]) -> bool:
+    lowered = text.lower()
+    return any(hint in lowered for hint in hints)
+
+
 def detect_question_type(question: str) -> str:
-    q = question.strip()
-    if any(k in q for k in ("\u4e3a\u4ec0\u4e48", "\u539f\u56e0", "\u5bfc\u81f4", "\u5982\u4f55\u5f71\u54cd", "\u673a\u5236")):
+    q = question.lower().strip()
+    if contains_any(q, ("why", "cause", "reason", "impact", "effect", "consequence", "risk", "mechanism", "lead to")):
         return "cause"
-    if any(k in q for k in ("\u533a\u522b", "\u4e0d\u540c", "\u5bf9\u6bd4", "\u6bd4\u8f83", "\u5f02\u540c")):
+    if contains_any(q, ("compare", "compared", "difference", "different", "versus", " vs ", "better", "worse")):
         return "comparison"
-    if any(k in q for k in ("\u5982\u4f55", "\u600e\u4e48", "\u6b65\u9aa4", "\u6d41\u7a0b", "\u5b9e\u73b0")):
+    if contains_any(q, ("how to", "steps", "process", "procedure", "workflow", "method", "implement")):
         return "procedure"
-    if any(k in q for k in ("\u591a\u5c11", "\u51e0", "\u6570\u503c", "\u6bd4\u4f8b", "\u53c2\u6570")):
+    if contains_any(q, NUMERIC_HINTS) or re.search(r"\b(how many|how much)\b", q):
         return "numeric"
-    if any(k in q for k in ("\u662f\u4ec0\u4e48", "\u5b9a\u4e49", "\u542b\u4e49", "\u6982\u5ff5")):
+    if re.search(r"\b(what is|what are|define|definition|meaning of)\b", q):
         return "definition"
-    if any(k in q for k in ("\u8c01", "\u4f55\u65f6", "\u54ea\u91cc", "\u54ea\u4e00")):
+    if re.search(r"\b(who|when|where|which|name)\b", q):
         return "factoid"
     return "other"
 
 
 def tokenize_query_terms(text: str) -> List[str]:
-    pieces = re.findall(r"[A-Za-z0-9\-]+|[\u4e00-\u9fff]{2,8}", text.lower())
-    return [piece for piece in pieces if piece not in QUESTION_STOPWORDS]
+    pieces = TOKEN_RE.findall(text.lower())
+    terms = []
+    for piece in pieces:
+        norm = normalize_term(piece)
+        if norm and norm not in QUESTION_STOPWORDS:
+            terms.append(norm)
+    return terms
 
 
 def query_overlap_score(question: str, text: str) -> float:
@@ -146,32 +217,55 @@ def query_overlap_score(question: str, text: str) -> float:
     return len(q_terms & t_terms) / max(len(q_terms), 1)
 
 
+def starts_with_example_marker(text: str) -> bool:
+    stripped = text.strip().lower()
+    return stripped.startswith(("for example", "for instance", "e.g.", "such as"))
+
+
+def question_seeks_outcome_examples(question: str) -> bool:
+    lowered = question.lower()
+    list_hints = ("what", "which", "list", "name")
+    return any(hint in lowered for hint in list_hints) and any(hint in lowered for hint in OUTCOME_HINTS)
+
+
 def task_anchor_score(question: str, text: str, question_type: str | None = None) -> float:
     q_type = question_type or detect_question_type(question)
     score = 0.0
     lowered = text.lower()
 
-    if q_type == "cause" and any(h in lowered for h in CAUSE_HINTS):
+    if q_type == "cause" and contains_any(lowered, CAUSE_HINTS):
         score += 0.45
-    if q_type == "comparison" and any(h in lowered for h in COMPARISON_HINTS):
+    if q_type == "cause" and contains_any(lowered, EXPLANATORY_EVIDENCE_HINTS):
+        score += 0.18
+    if q_type == "comparison" and contains_any(lowered, COMPARISON_HINTS):
         score += 0.45
-    if q_type == "procedure" and any(h in lowered for h in PROCEDURE_HINTS):
+    if q_type == "procedure" and contains_any(lowered, PROCEDURE_HINTS):
         score += 0.45
-    if q_type == "numeric" and (any(h in lowered for h in NUMERIC_HINTS) or re.search(r"\d", text)):
+    if q_type == "numeric" and (contains_any(lowered, NUMERIC_HINTS) or re.search(r"\d", text)):
         score += 0.45
+    if q_type == "definition" and contains_any(lowered, ("defined as", "refers to", "is a", "is an", "means")):
+        score += 0.35
     if q_type == "factoid" and (
-        any(h in lowered for h in FACTOID_HINTS)
-        or re.search(r"\d{4}|\d{1,2}[:\uff1a]\d{2}", text)
-        or re.search(r"[A-Z][a-z]+", text)
+        contains_any(lowered, FACTOID_HINTS)
+        or re.search(r"\d{4}|\d{1,2}:\d{2}", text)
+        or re.search(r"\b[A-Z][a-zA-Z0-9-]{2,}\b", text)
     ):
         score += 0.45
 
+    if question_seeks_outcome_examples(question):
+        if contains_any(lowered, OUTCOME_HINTS):
+            score += 0.25
+        if starts_with_example_marker(text):
+            score += 0.30
+
     if re.search(r"\d", text):
         score += 0.15
-    if any(h in lowered for h in NEGATION_HINTS):
+    if contains_any(lowered, NEGATION_HINTS):
         score += 0.15
-    if re.search(r"[A-Za-z]{2,}|[\u4e00-\u9fff]{2,8}", text):
+    if re.search(r"\b[A-Z][a-zA-Z0-9-]{2,}\b", text):
         score += 0.10
+    if re.search(r"[A-Za-z]{3,}", text):
+        score += 0.05
 
     return float(min(score, 1.0))
 
@@ -180,22 +274,37 @@ def compute_task_reward(question: str, text: str, question_type: str | None = No
     q_type = question_type or detect_question_type(question)
     overlap = query_overlap_score(question, text)
     anchor = task_anchor_score(question, text, q_type)
-    bonus = 0.08 if q_type in COMPLEX_QTYPES and len(text) > 12 else 0.0
-    return float(min(0.55 * overlap + 0.35 * anchor + bonus, 1.0))
+    bonus = 0.08 if q_type in COMPLEX_QTYPES and len(tokenize_query_terms(text)) > 8 else 0.0
+    lowered_question = question.lower()
+    lowered_text = text.lower()
+    if q_type == "cause":
+        if contains_any(lowered_text, EXPLANATORY_EVIDENCE_HINTS):
+            bonus += 0.10
+        if re.search(r"\b(include|includes|such as|for example)\b", lowered_text):
+            bonus += 0.10
+        if contains_any(lowered_question, ("critical", "threshold", "risk", "tipping")) and contains_any(lowered_text, OUTCOME_HINTS):
+            bonus += 0.10
+    return float(min(0.50 * overlap + 0.35 * anchor + min(bonus, 0.28), 1.0))
 
 
 @dataclass
 class IntraSentenceCompressionConfig:
-    target_keep_ratio: float = 0.78
-    min_keep_ratio: float = 0.55
-    max_keep_ratio: float = 0.92
-    attention_weight: float = 0.45
-    anchor_weight: float = 0.30
-    overlap_weight: float = 0.25
-    reward_weight: float = 0.15
+    target_keep_ratio: float = 0.56
+    min_keep_ratio: float = 0.36
+    max_keep_ratio: float = 0.76
+    attention_weight: float = 0.25
+    anchor_weight: float = 0.34
+    overlap_weight: float = 0.34
+    reward_weight: float = 0.22
+    learned_keep_weight: float = 0.72
+    learned_soft_protected_threshold: float = 0.28
+    min_question_term_recall_after_prune: float = 0.72
+    mismatch_penalty: float = 0.12
+    filler_penalty: float = 0.16
     probe_layers: int = 2
-    min_sentence_chars: int = 18
+    min_sentence_chars: int = 45
     min_spans_to_compress: int = 2
+    min_evidence_list_items: int = 2
 
 
 @dataclass
@@ -248,7 +357,7 @@ class DynamicSpanCompressor:
         if self.learned_span_model is None or not spans:
             return []
 
-        sentence = "".join(span.text for span in spans)
+        sentence = " ".join(span.text for span in spans)
         sentence_length = max(len(sentence), 1)
         sentence_token_length = max(self._count_tokens(sentence), 1)
         feature_rows = []
@@ -289,7 +398,7 @@ class DynamicSpanCompressor:
         if not sentences:
             return [], {"sentence_stats": [], "removed_span_count": 0}
 
-        keep_ratios = self.allocate_sentence_keep_ratios(question, sentence_scores)
+        keep_ratios = self.allocate_sentence_keep_ratios(question, sentences, sentence_scores)
         compressed_sentences: List[str] = []
         sentence_stats = []
         removed_total = 0
@@ -298,7 +407,8 @@ class DynamicSpanCompressor:
             compressed, stats = self.compress_sentence(question, sentence, keep_ratio, score)
             stats["sentence_score"] = float(score)
             stats["keep_ratio"] = float(keep_ratio)
-            compressed_sentences.append(compressed)
+            if compressed.strip():
+                compressed_sentences.append(compressed)
             sentence_stats.append(stats)
             removed_total += int(stats["removed_span_count"])
 
@@ -307,18 +417,52 @@ class DynamicSpanCompressor:
             "removed_span_count": removed_total,
         }
 
+    def compute_sentence_marginal_information_gains(
+        self,
+        question: str,
+        sentences: Sequence[str],
+        sentence_scores: Sequence[float],
+    ) -> List[float]:
+        if not sentences:
+            return []
+
+        relevance_scores = []
+        for idx, sentence in enumerate(sentences):
+            base_score = float(sentence_scores[idx]) if idx < len(sentence_scores) else 0.5
+            overlap = query_overlap_score(question, sentence)
+            anchor = task_anchor_score(question, sentence)
+            relevance_scores.append(0.50 * base_score + 0.25 * overlap + 0.25 * anchor)
+
+        mig_scores = []
+        for idx, sentence in enumerate(sentences):
+            sentence_terms = set(tokenize_query_terms(sentence))
+            redundancy = 0.0
+            for other_idx, other_sentence in enumerate(sentences):
+                if idx == other_idx:
+                    continue
+                other_terms = set(tokenize_query_terms(other_sentence))
+                if not sentence_terms or not other_terms:
+                    continue
+                overlap = len(sentence_terms & other_terms) / max(len(sentence_terms | other_terms), 1)
+                redundancy = max(redundancy, overlap)
+            mig_scores.append(float(relevance_scores[idx] - 0.45 * redundancy))
+        return normalize_scores(mig_scores)
+
     def allocate_sentence_keep_ratios(
         self,
         question: str,
+        sentences: Sequence[str],
         sentence_scores: Sequence[float],
     ) -> List[float]:
         normalized_scores = normalize_scores(sentence_scores)
+        mig_scores = self.compute_sentence_marginal_information_gains(question, sentences, sentence_scores)
         question_type = detect_question_type(question)
-        complexity_bonus = 0.04 if question_type in COMPLEX_QTYPES else 0.0
+        complexity_bonus = 0.02 if question_type in COMPLEX_QTYPES else 0.0
 
         ratios = []
-        for score in normalized_scores:
-            ratio = self.config.target_keep_ratio + 0.18 * score + complexity_bonus
+        for idx, score in enumerate(normalized_scores):
+            mig = mig_scores[idx] if idx < len(mig_scores) else 0.5
+            ratio = self.config.target_keep_ratio + 0.05 * score + 0.04 * mig + complexity_bonus
             ratio = min(self.config.max_keep_ratio, max(self.config.min_keep_ratio, ratio))
             ratios.append(float(ratio))
         return ratios
@@ -337,27 +481,46 @@ class DynamicSpanCompressor:
             return original, self._build_sentence_stats(original, original, [], [])
 
         spans = self.split_sentence_into_spans(question, original, question_type)
+        spans = self.refine_long_spans(question, spans, question_type)
+        spans = self.apply_evidence_list_floor(question, spans, question_type)
         if len(spans) < self.config.min_spans_to_compress:
             return original, self._build_sentence_stats(original, original, spans, [])
 
         target_tokens = max(1, int(self._count_tokens(original) * keep_ratio))
         current_spans = spans[:]
         removed_spans: List[str] = []
+        skipped_by_safety = 0
 
         while len(current_spans) > 1 and self._count_span_tokens(current_spans) > target_tokens:
             ranked_candidates = self.rank_removal_candidates(question, current_spans, question_type, sentence_score, keep_ratio)
             if not ranked_candidates:
                 break
 
-            _, remove_idx, remove_text = ranked_candidates[0]
+            selected_candidate = None
+            for _, remove_idx, remove_text in ranked_candidates:
+                if self.can_remove_span_safely(question, current_spans, remove_idx, question_type):
+                    selected_candidate = (remove_idx, remove_text)
+                    break
+                skipped_by_safety += 1
+
+            if selected_candidate is None:
+                break
+
+            remove_idx, remove_text = selected_candidate
             removed_spans.append(remove_text)
             current_spans.pop(remove_idx)
 
-        compressed = self.cleanup_sentence("".join(span.text for span in current_spans), original)
-        if not compressed:
+        compressed = self.cleanup_sentence(" ".join(span.text for span in current_spans), original)
+        dropped_sentence = self.should_drop_sentence_after_prune(question, current_spans, question_type)
+        if dropped_sentence:
+            compressed = ""
+        if not compressed and current_spans and not dropped_sentence:
             compressed = original
 
         stats = self._build_sentence_stats(original, compressed, current_spans, removed_spans)
+        stats["safety_skipped_count"] = skipped_by_safety
+        if not compressed:
+            stats["dropped_sentence"] = True
         if self.learned_span_model is not None:
             stats["compression_mode"] = "hybrid_learned_span_prune"
         else:
@@ -395,17 +558,38 @@ class DynamicSpanCompressor:
 
         candidates = []
         dac_weight = 0.20 if any(score > 0.0 for score in dac_scores) else 0.0
-        model_weight = 0.40 if learned_keep_scores else 0.0
+        model_weight = self.config.learned_keep_weight if learned_keep_scores else 0.0
         for idx, span in enumerate(spans):
+            soft_protected_candidate = False
             if span.protected:
-                continue
-            if len(spans) <= 3 and idx in {0, len(spans) - 1}:
+                if (
+                    not learned_keep_scores
+                    or self.is_hard_protected_span(question, span, question_type)
+                    or learned_keep_scores[idx] >= self.config.learned_soft_protected_threshold
+                ):
+                    continue
+                soft_protected_candidate = True
+
+            if span.protected and not soft_protected_candidate:
                 continue
 
             overlap = overlap_scores[idx]
             anchor = anchor_scores[idx]
             reward = reward_scores[idx]
-            if anchorful_count <= 1 and (overlap > 0.0 or anchor >= 0.45):
+            allow_edge_removal = (
+                len(spans) <= 3
+                and idx in {0, len(spans) - 1}
+                and overlap == 0.0
+                and anchor < 0.45
+                and (span.kind in {"tail", "source_attribution", "background_lead"} or self.is_temporal_background_span(span.text))
+            )
+            if span.kind in {"source_attribution", "background_lead"}:
+                allow_edge_removal = True
+
+            if len(spans) <= 3 and idx in {0, len(spans) - 1} and not allow_edge_removal:
+                continue
+
+            if anchorful_count <= 1 and (overlap > 0.0 or anchor >= 0.45) and not soft_protected_candidate:
                 continue
 
             heuristic_importance = (
@@ -418,19 +602,174 @@ class DynamicSpanCompressor:
             importance = heuristic_importance
             if learned_keep_scores:
                 importance = (1.0 - model_weight) * heuristic_importance + model_weight * learned_keep_scores[idx]
+            if overlap == 0.0 and anchor < 0.45:
+                importance -= self.config.mismatch_penalty
+            if self.is_temporal_background_span(span.text) and question_type not in {"numeric", "factoid"}:
+                importance -= 0.10
             if span.kind == "parenthetical":
                 importance -= 0.18
+            elif span.kind == "source_attribution":
+                importance -= 0.22
+            elif span.kind == "background_lead":
+                importance -= 0.16
             elif span.kind == "example":
-                importance -= 0.12
+                importance -= 0.10
             elif span.kind == "tail":
                 importance -= 0.05
             if self.is_low_value_filler(span.text):
-                importance -= 0.08
+                importance -= self.config.filler_penalty
 
             candidates.append((float(importance), idx, span.text))
 
         candidates.sort(key=lambda item: item[0])
         return candidates
+
+    def is_hard_protected_span(
+        self,
+        question: str,
+        span: SpanUnit,
+        question_type: str,
+    ) -> bool:
+        text = span.text
+        lowered = text.lower()
+        overlap = query_overlap_score(question, text)
+        if overlap >= 0.35:
+            return True
+        if contains_any(lowered, NEGATION_HINTS) or contains_any(lowered, COMPARISON_HINTS):
+            return True
+        if re.search(r"\d", text) and (question_type in {"numeric", "factoid"} or re.search(r"\d", question)):
+            return True
+        if question_type == "cause" and contains_any(lowered, ("include", "includes", "because", "therefore", "due to")):
+            return True
+        if text.strip().endswith(":"):
+            return True
+        return False
+
+    def can_remove_span_safely(
+        self,
+        question: str,
+        spans: Sequence[SpanUnit],
+        remove_idx: int,
+        question_type: str,
+    ) -> bool:
+        if len(spans) <= 1 or remove_idx < 0 or remove_idx >= len(spans):
+            return False
+
+        span = spans[remove_idx]
+        if self.is_hard_protected_span(question, span, question_type):
+            return False
+
+        remaining = [candidate for idx, candidate in enumerate(spans) if idx != remove_idx]
+        if not remaining:
+            return False
+
+        before_question_terms = self.question_terms_present_in_spans(question, spans)
+        if before_question_terms:
+            after_question_terms = self.question_terms_present_in_spans(question, remaining)
+            recall = len(before_question_terms & after_question_terms) / max(len(before_question_terms), 1)
+            if recall < self.config.min_question_term_recall_after_prune:
+                return False
+
+        before_anchor_count = self.semantic_anchor_count(question, spans, question_type)
+        after_anchor_count = self.semantic_anchor_count(question, remaining, question_type)
+        if before_anchor_count > 0 and after_anchor_count == 0:
+            return False
+
+        if self.requires_evidence_list_floor(question, spans, question_type):
+            before_items = self.evidence_item_count(question, spans, question_type)
+            after_items = self.evidence_item_count(question, remaining, question_type)
+            required_items = self.required_evidence_item_count(question, before_items)
+            if before_items >= required_items and after_items < required_items:
+                return False
+
+        if question_type in {"definition", "numeric", "factoid"}:
+            overlap = query_overlap_score(question, span.text)
+            anchor = task_anchor_score(question, span.text, question_type)
+            if overlap > 0.0 or anchor >= 0.45:
+                return False
+
+        if span.protected:
+            learned_scores = self.predict_learned_keep_scores(
+                question=question,
+                spans=spans,
+                question_type=question_type,
+                sentence_score=0.5,
+                keep_ratio=self.config.target_keep_ratio,
+                attention_scores=[0.0 for _ in spans],
+                dac_scores=[0.0 for _ in spans],
+            )
+            if learned_scores and learned_scores[remove_idx] >= self.config.learned_soft_protected_threshold:
+                return False
+
+        return True
+
+    def question_terms_present_in_spans(self, question: str, spans: Sequence[SpanUnit]) -> set[str]:
+        question_terms = set(tokenize_query_terms(question))
+        if not question_terms:
+            return set()
+        span_terms = set()
+        for span in spans:
+            span_terms.update(tokenize_query_terms(span.text))
+        return question_terms & span_terms
+
+    def semantic_anchor_count(
+        self,
+        question: str,
+        spans: Sequence[SpanUnit],
+        question_type: str,
+    ) -> int:
+        count = 0
+        for span in spans:
+            lowered = span.text.lower()
+            overlap = query_overlap_score(question, span.text)
+            anchor = task_anchor_score(question, span.text, question_type)
+            if overlap > 0.0 or anchor >= 0.45:
+                count += 1
+            elif question_type == "cause" and contains_any(lowered, EXPLANATORY_EVIDENCE_HINTS + CAUSE_HINTS):
+                count += 1
+            elif question_type == "procedure" and contains_any(lowered, PROCEDURE_HINTS):
+                count += 1
+        return count
+
+    def requires_evidence_list_floor(
+        self,
+        question: str,
+        spans: Sequence[SpanUnit],
+        question_type: str,
+    ) -> bool:
+        if question_type != "cause":
+            return False
+        return any(
+            contains_any(span.text.lower(), ("include", "includes", "including", "such as", "for example"))
+            for span in spans
+        )
+
+    def required_evidence_item_count(self, question: str, available_items: int) -> int:
+        required = self.config.min_evidence_list_items
+        if question_seeks_outcome_examples(question):
+            required = max(required, 3)
+        return min(required, max(available_items, 0))
+
+    def evidence_item_count(
+        self,
+        question: str,
+        spans: Sequence[SpanUnit],
+        question_type: str,
+    ) -> int:
+        count = 0
+        for span in spans:
+            lowered = span.text.lower()
+            if self.is_structural_lead_span(span.text) and not contains_any(lowered, EXPLANATORY_EVIDENCE_HINTS):
+                continue
+            if query_overlap_score(question, span.text) > 0.0:
+                count += 1
+            elif task_anchor_score(question, span.text, question_type) >= 0.45:
+                count += 1
+            elif contains_any(lowered, EXPLANATORY_EVIDENCE_HINTS + OUTCOME_HINTS):
+                count += 1
+            elif len(tokenize_query_terms(span.text)) >= 2 and span.kind != "source_attribution":
+                count += 1
+        return count
 
     def split_sentence_into_spans(
         self,
@@ -464,6 +803,141 @@ class DynamicSpanCompressor:
 
         return spans
 
+    def refine_long_spans(
+        self,
+        question: str,
+        spans: Sequence[SpanUnit],
+        question_type: str,
+    ) -> List[SpanUnit]:
+        refined: List[SpanUnit] = []
+        for span in spans:
+            source_split = self.split_source_attribution_span(question, span, question_type)
+            for source_span in source_split:
+                clause_split = self.split_relative_or_contrast_clause(question, source_span, question_type)
+                for clause_span in clause_split:
+                    refined.extend(self.split_coordination_span(question, clause_span, question_type))
+        return refined
+
+    def split_source_attribution_span(
+        self,
+        question: str,
+        span: SpanUnit,
+        question_type: str,
+    ) -> List[SpanUnit]:
+        if self._count_tokens(span.text) < 14:
+            return [span]
+        pattern = re.compile(
+            r"\b(reports?|reported|states?|stated|finds?|found|shows?|showed|suggests?|suggested|notes?|noted|argues?|argued)\s+that\b",
+            flags=re.IGNORECASE,
+        )
+        match = pattern.search(span.text)
+        if not match or match.end() >= len(span.text) - 8:
+            return [span]
+
+        lead_text = span.text[: match.end()].strip()
+        evidence_text = span.text[match.end() :].strip()
+        if self._count_tokens(evidence_text) < 6:
+            return [span]
+
+        lead = self.build_span(question, lead_text, span.start, span.start + match.end(), question_type, kind_override="source_attribution")
+        evidence = self.build_span(question, evidence_text, span.start + match.end(), span.end, question_type)
+        return [lead, evidence]
+
+    def split_relative_or_contrast_clause(
+        self,
+        question: str,
+        span: SpanUnit,
+        question_type: str,
+    ) -> List[SpanUnit]:
+        if self._count_tokens(span.text) < 14:
+            return [span]
+
+        match = re.search(
+            r",\s+(which|who|where|while|whereas|although|though|but|however)\b",
+            span.text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return [span]
+
+        lead_text = span.text[: match.start()].strip()
+        tail_text = span.text[match.start() + 1 :].strip()
+        if self._count_tokens(lead_text) < 5 or self._count_tokens(tail_text) < 5:
+            return [span]
+
+        lead = self.build_span(question, lead_text, span.start, span.start + match.start(), question_type)
+        tail = self.build_span(question, tail_text, span.start + match.start() + 1, span.end, question_type, kind_override="tail")
+        return [lead, tail]
+
+    def split_coordination_span(
+        self,
+        question: str,
+        span: SpanUnit,
+        question_type: str,
+    ) -> List[SpanUnit]:
+        if self._count_tokens(span.text) < 11:
+            return [span]
+
+        lowered = span.text.lower()
+        connector_count = len(re.findall(r"\b(?:and|or)\b", lowered))
+        list_like = contains_any(lowered, ("include", "includes", "including", "such as", "consist of"))
+        if connector_count < 2 and not list_like:
+            return [span]
+
+        connectors = list(re.finditer(r"\s+(and|or)\s+", span.text, flags=re.IGNORECASE))
+        for match in reversed(connectors):
+            lead_text = span.text[: match.start()].strip()
+            tail_text = span.text[match.start() :].strip()
+            if self._count_tokens(lead_text) < 6 or self._count_tokens(tail_text) < 3:
+                continue
+            if len(tokenize_query_terms(tail_text)) < 2 and not re.search(r"\d", tail_text):
+                continue
+            lead = self.build_span(question, lead_text, span.start, span.start + match.start(), question_type)
+            tail = self.build_span(question, tail_text, span.start + match.start(), span.end, question_type, kind_override="tail")
+            return [lead, tail]
+
+        return [span]
+
+    def apply_evidence_list_floor(
+        self,
+        question: str,
+        spans: Sequence[SpanUnit],
+        question_type: str,
+    ) -> List[SpanUnit]:
+        if question_type != "cause" or len(spans) < 3:
+            return list(spans)
+
+        lead_idx = None
+        for idx, span in enumerate(spans):
+            lowered = span.text.lower()
+            if contains_any(lowered, ("include", "includes", "such as")) and contains_any(lowered, OUTCOME_HINTS + EXPLANATORY_EVIDENCE_HINTS):
+                lead_idx = idx
+                break
+        if lead_idx is None:
+            return list(spans)
+
+        out = list(spans)
+        evidence_indices = [
+            idx
+            for idx in range(lead_idx + 1, len(out))
+            if len(tokenize_query_terms(out[idx].text)) >= 2 or contains_any(out[idx].text.lower(), EXPLANATORY_EVIDENCE_HINTS)
+        ]
+        keep_count = self.config.min_evidence_list_items
+        if question_seeks_outcome_examples(question):
+            keep_count = max(keep_count, 3)
+        extra_keep_count = max(0, keep_count - 1)
+
+        out[lead_idx].protected = True
+        for rank, idx in enumerate(evidence_indices):
+            span = out[idx]
+            has_hard_anchor = (
+                query_overlap_score(question, span.text) > 0.0
+                or re.search(r"\d", span.text)
+                or contains_any(span.text.lower(), NEGATION_HINTS + COMPARISON_HINTS)
+            )
+            span.protected = bool(rank < extra_keep_count or has_hard_anchor)
+        return out
+
     def build_protected_char_mask(
         self,
         question: str,
@@ -492,12 +966,12 @@ class DynamicSpanCompressor:
                     if 0 <= pos < len(mask):
                         mask[pos] = True
 
-        for match in re.finditer(r"\d+", sentence):
+        for match in re.finditer(r"\d+(?:\.\d+)?%?", sentence):
             for pos in range(match.start(), match.end()):
                 mask[pos] = True
 
         for span in spans:
-            if span.protected and len(span.text) <= 12:
+            if span.protected and len(span.text) <= 24:
                 for pos in range(span.start, min(span.end, len(mask))):
                     mask[pos] = True
 
@@ -508,7 +982,7 @@ class DynamicSpanCompressor:
         question: str,
         spans: Sequence[SpanUnit],
     ) -> List[float]:
-        sentence = "".join(span.text for span in spans)
+        sentence = " ".join(span.text for span in spans)
         dac_scores = self.dac_adapter.score_spans(question, sentence, spans)
         if dac_scores is None:
             return [0.0 for _ in spans]
@@ -521,26 +995,38 @@ class DynamicSpanCompressor:
         start: int,
         end: int,
         question_type: str,
+        kind_override: str | None = None,
     ) -> SpanUnit:
         stripped = text.strip()
         lowered = stripped.lower()
+        outcome_question = question_seeks_outcome_examples(question)
 
-        kind = "content"
-        if stripped.startswith(("(", "\uff08", "\u3010")) and stripped.endswith((")", "\uff09", "\u3011")):
+        kind = kind_override or "content"
+        if stripped.startswith(("(", "[", "{")) and stripped.endswith((")", "]", "}")):
             kind = "parenthetical"
-        elif any(h in lowered for h in EXAMPLE_HINTS):
+        elif starts_with_example_marker(stripped) or contains_any(lowered, EXAMPLE_HINTS):
             kind = "example"
-        elif start > 0 and len(stripped) <= 12:
+        elif start > 0 and len(tokenize_query_terms(stripped)) <= 4:
             kind = "tail"
 
         overlap = query_overlap_score(question, stripped)
         anchor = task_anchor_score(question, stripped, question_type)
         protected = overlap > 0.0 or anchor >= 0.45
-        if stripped.endswith(("\uff1a", ":")) and len(stripped) > 8:
+        if outcome_question and kind == "example":
             protected = True
-        if re.search(r"\b(i|ii|iii)\b", lowered) or any(tag in stripped for tag in ("\u4e00\u662f", "\u4e8c\u662f", "\u4e09\u662f")):
+        if outcome_question and contains_any(stripped, OUTCOME_HINTS):
+            protected = True
+        if question_type == "cause" and contains_any(lowered, EXPLANATORY_EVIDENCE_HINTS):
+            protected = protected or query_overlap_score(question, stripped) > 0.0
+        if contains_any(lowered, NEGATION_HINTS) or contains_any(lowered, COMPARISON_HINTS):
+            protected = True
+        if stripped.endswith(":") and len(stripped) > 12:
+            protected = True
+        if re.search(r"\b(i|ii|iii|iv|v|first|second|third)\b", lowered):
             protected = True
         if kind == "parenthetical" and overlap == 0.0 and anchor < 0.45:
+            protected = False
+        if kind == "source_attribution" and question_type not in {"factoid"}:
             protected = False
 
         return SpanUnit(
@@ -556,13 +1042,14 @@ class DynamicSpanCompressor:
         question: str,
         spans: Sequence[SpanUnit],
     ) -> List[float]:
-        sentence = "".join(span.text for span in spans)
+        sentence = " ".join(span.text for span in spans)
         if not sentence or not getattr(self.tokenizer, "is_fast", False):
             return [0.0 for _ in spans]
 
         try:
+            encoded_question = self.sentence_encoder.format_query(question) if hasattr(self.sentence_encoder, "format_query") else question
             batch = self.tokenizer(
-                question,
+                encoded_question,
                 sentence,
                 truncation=True,
                 max_length=self.max_length,
@@ -625,30 +1112,63 @@ class DynamicSpanCompressor:
         return scores
 
     def is_low_value_filler(self, text: str) -> bool:
-        lowered = text.lower()
-        if len(text) <= 8:
+        lowered = text.lower().strip()
+        if len(tokenize_query_terms(text)) <= 4:
             return False
-        if any(h in lowered for h in EXAMPLE_HINTS):
-            return True
         filler_markers = (
-            "\u603b\u7684\u6765\u8bf4",
-            "\u603b\u800c\u8a00\u4e4b",
-            "\u6362\u53e5\u8bdd\u8bf4",
-            "\u6362\u8a00\u4e4b",
-            "\u603b\u4f53\u6765\u770b",
+            "as discussed above",
+            "in general",
+            "in other words",
+            "more broadly",
+            "overall",
+            "taken together",
+            "to summarize",
         )
         return any(marker in lowered for marker in filler_markers)
 
+    def is_temporal_background_span(self, text: str) -> bool:
+        lowered = text.lower()
+        if re.search(r"\b(19|20)\d{2}\b", text):
+            return True
+        markers = ("historically", "in recent years", "over time", "previously", "since then")
+        return any(marker in lowered for marker in markers)
+
+    def is_structural_lead_span(self, text: str) -> bool:
+        stripped = text.strip().lower()
+        if stripped.endswith(":"):
+            return True
+        lead_markers = ("include", "includes", "consist of", "the following", "there are")
+        return any(marker in stripped for marker in lead_markers)
+
+    def should_drop_sentence_after_prune(
+        self,
+        question: str,
+        kept_spans: Sequence[SpanUnit],
+        question_type: str,
+    ) -> bool:
+        if len(kept_spans) != 1:
+            return False
+        text = kept_spans[0].text.strip()
+        if not self.is_structural_lead_span(text):
+            return False
+        if query_overlap_score(question, text) > 0.0:
+            return False
+        if task_anchor_score(question, text, question_type) >= 0.45:
+            return False
+        return True
+
     def cleanup_sentence(self, text: str, original: str) -> str:
         cleaned = re.sub(r"\s+", " ", text).strip()
-        cleaned = re.sub(r"\s+([\uff0c\u3002\uff01\uff1f\uff1b\uff1a,.;!?])", r"\1", cleaned)
-        cleaned = re.sub(r"([\uff08(\u3010])\s+", r"\1", cleaned)
-        cleaned = re.sub(r"\s+([\uff09)\u3011])", r"\1", cleaned)
-        cleaned = re.sub(r"([\uff0c\uff1b\uff1a,;:]){2,}", lambda m: m.group(0)[0], cleaned)
-        cleaned = cleaned.strip("\uff0c,\uff1b;\uff1a:")
+        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        cleaned = re.sub(r"([([{])\s+", r"\1", cleaned)
+        cleaned = re.sub(r"\s+([)\]}])", r"\1", cleaned)
+        cleaned = re.sub(r"([,;:]){2,}", lambda match: match.group(0)[0], cleaned)
+        cleaned = cleaned.strip(" ,;:")
 
-        if original and original[-1] in "\u3002\uff01\uff1f.!?" and (not cleaned or cleaned[-1] not in "\u3002\uff01\uff1f.!?"):
+        if original and original[-1] in ".!?" and (not cleaned or cleaned[-1] not in ".!?"):
             cleaned = cleaned + original[-1]
+        if cleaned and original[:1].isupper() and cleaned[:1].islower():
+            cleaned = cleaned[:1].upper() + cleaned[1:]
         return cleaned
 
     def _count_tokens(self, text: str) -> int:
@@ -657,7 +1177,7 @@ class DynamicSpanCompressor:
         try:
             return max(1, len(self.tokenizer.tokenize(text)))
         except Exception:
-            return max(1, len(text))
+            return max(1, len(TOKEN_RE.findall(text)))
 
     def _count_span_tokens(self, spans: Sequence[SpanUnit]) -> int:
         return sum(self._count_tokens(span.text) for span in spans)
@@ -675,15 +1195,9 @@ class DynamicSpanCompressor:
             "removed_spans": list(removed_spans),
             "removed_span_count": len(removed_spans),
             "kept_spans": [span.text for span in kept_spans],
+            "protected_kept_spans": [span.text for span in kept_spans if span.protected],
+            "kept_span_kinds": [span.kind for span in kept_spans],
             "original_tokens": self._count_tokens(original),
             "compressed_tokens": self._count_tokens(compressed),
         }
-
-
-
-
-
-
-
-
 

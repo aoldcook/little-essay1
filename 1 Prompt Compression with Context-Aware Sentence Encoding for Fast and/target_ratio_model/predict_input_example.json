@@ -1,5 +1,5 @@
-{
-  "question": "为什么多跳问答任务通常需要更高的压缩预算？",
-  "context": "多跳问答往往涉及多个实体和多个证据片段。高分句可能只回答了问题的一部分。桥接句负责把不同事实连接起来。解释句则说明它们之间的因果或关系。若预算过小，推理链就会中断。",
+﻿{
+  "question": "Why do multi-hop question answering tasks usually need a larger compression budget?",
+  "context": "Multi-hop questions involve multiple entities and several pieces of evidence. A high-scoring sentence may answer only part of the question. Bridge sentences connect separate facts. Explanation sentences describe the causal or relational link between them. If the budget is too small, the reasoning chain can break.",
   "similarities": [0.86, 0.84, 0.81, 0.79, 0.75]
 }

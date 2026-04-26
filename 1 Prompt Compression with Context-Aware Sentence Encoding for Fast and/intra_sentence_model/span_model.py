@@ -52,8 +52,12 @@ def load_span_model(model_dir: str | Path, device: str | torch.device) -> Tuple[
         dropout=float(metadata.get("dropout", 0.1)),
     )
     model = SpanClassifierMLP(config)
-    state = torch.load(model_dir / "span_model.pt", map_location=device)
+    model_path = model_dir / "span_model.best.pt"
+    if not model_path.exists():
+        model_path = model_dir / "span_model.pt"
+    state = torch.load(model_path, map_location=device)
     model.load_state_dict(state)
     model.to(device)
     model.eval()
     return model, metadata
+

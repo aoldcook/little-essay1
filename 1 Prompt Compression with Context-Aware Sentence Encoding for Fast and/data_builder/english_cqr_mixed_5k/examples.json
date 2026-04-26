@@ -1,0 +1,82 @@
+[
+  {
+    "dataset": "longbench_multifieldqa_en",
+    "quality": "silver",
+    "question": "What position did Simon English hold in the 2008 general election?",
+    "positive_sentence": "Sir Simon William English (born 30 December 1961) is a New Zealand former National Party politician who served as the 39th prime minister of New Zealand from 2016 to 2017.",
+    "negative_sentences": [
+      "At the time of his re-election, English announced his intention to stay on as leader until the next general election.",
+      "At a press conference at the Beehive on 1 February 2017, English announced that the 2017 general election would be held on 23 September."
+    ]
+  },
+  {
+    "dataset": "wikitext103_pseudo_cqr",
+    "quality": "silver",
+    "question": "What information is given about Larry Carroll?",
+    "positive_sentence": "Larry Carroll for MTV wrote that the extent of Rihanna 's ability to play the guitar was limited to playing it with one finger on one of the strings .",
+    "negative_sentences": [
+      "A reviewer for MTV UK agreed with Carroll , writing that \" halfway through the performance [ Rihanna ] donned a ' black flying v guitar ' although we 're not sure you could say she ' played ' it !",
+      "Further west is the Bargate ;"
+    ]
+  },
+  {
+    "dataset": "hotpotqa_supporting_facts",
+    "quality": "gold",
+    "question": "Sue Bennett College is located in what Kentucky county?",
+    "positive_sentence": "Sue Bennett College was a private college in London, Kentucky which operated from 1897 through 1997.",
+    "negative_sentences": [
+      "His last head coaching stint was at Sue Bennett College in London, Kentucky from 1992 to 1995, compiling 48 wins during the three seasons that he coached.",
+      "Bennett College is a private four-year historically black liberal arts college for women located in Greensboro, North Carolina."
+    ]
+  },
+  {
+    "dataset": "hotpotqa_supporting_facts",
+    "quality": "gold",
+    "question": "Jerez de los Caballeros is a town of south-western Spain, also the birthplace of the explorers Hernando de Soto and who?",
+    "positive_sentence": "It was also the birthplace of the explorers Hernando de Soto and Vasco Núñez de Balboa.",
+    "negative_sentences": [
+      "Jerez de los Caballeros is a town of south-western Spain, in the province of Badajoz.",
+      "On 10 May 1539, Hernando de Soto wrote in his will: \"That a chapel be erected within the Church of San Miguel in Jerez de los Cabelleros, Spain, where De Soto grew up, at a cost of 2,000 ducats, with an altarpiece featuring the Virgin Mary, Our Lady of the Conception, that his tomb be covered in a fine black broadcloth topped by a red cross of the Order of the Knights of Santiago, and on special occasions a pall of black velvet with the De Soto coat of arms be placed on the altar; that a chaplain be hired at the salary of 12,000 maravedis to perform five masses every week for the souls of De Soto, his parents and wife; that thirty masses be said for him the day his body was interred, and twenty for our Lady of the Conception, ten for the Holy Ghost, sixty for souls in purgatory and masses for many others as well; that 150000 maravedis be given annually to his wife Isabel for her needs and an equal amount used yearly to marry off three orphan damsels...the poorest that can be found,\" who would then assist his wife and also serve to burnish the memory of De Soto as a man of charity and substance."
+    ]
+  },
+  {
+    "dataset": "hotpotqa_supporting_facts",
+    "quality": "gold",
+    "question": "When was the fort commanded by George Armistead during the Battle of Baltimore first built?",
+    "positive_sentence": "Fort McHenry, in Baltimore, Maryland, is a historical American coastal pentagonal bastion fort best known for its role in the War of 1812, when it successfully defended Baltimore Harbor from an attack by the British navy from the Chesapeake Bay September 13–14, 1814.",
+    "negative_sentences": [
+      "Mary Pickersgill (born Mary Young; February 12, 1776 – October 4, 1857), was the maker of the Star Spangled Banner Flag hoisted over Fort McHenry during the Battle of Baltimore in the War of 1812.",
+      "HMS \"Aetna\" was one of the Royal Navy bomb vessels involved in the attack on Fort McHenry in the Battle of Baltimore and the bombardment of Fort Washington, Maryland in 1814, during the War of 1812."
+    ]
+  },
+  {
+    "dataset": "wikitext103_pseudo_cqr",
+    "quality": "silver",
+    "question": "What is Kid Meyers?",
+    "positive_sentence": "Kid Meyers was a 1963 sorrel stallion , and had 23 starts on the racetrack , winning 6 times .",
+    "negative_sentences": [
+      "Unlike most foals , who nurse for months after birth , Kid Meyers was orphaned at the age of one month in March 1963 .",
+      "After Miss Meyers retired from the racetrack , she became the dam of the first AQHA Supreme Champion , Kid Meyers , sired by fellow Hall of Famer Three Bars , a Thoroughbred ."
+    ]
+  },
+  {
+    "dataset": "hotpotqa_supporting_facts",
+    "quality": "gold",
+    "question": "The plaintiff of Paul v. Clinton was convicted for business dealing with whom?",
+    "positive_sentence": "The plaintiff, Peter F. Paul, alleged that President Bill Clinton and his wife, First Lady Hillary Clinton, deceived him into paying for the Gala Hollywood Farewell Salute to President Clinton, during Hillary Clinton's first Senate race in 2000, by making a promise that the President would work for Paul's company, Stan Lee Media, after his presidential term was over.",
+    "negative_sentences": [
+      "Paul v. Davis, 424 U.S. 693 (1976), is a United States Supreme Court case in which a sharply divided Court held that the plaintiff, whom the local police chief had named an \"active shoplifter,\" suffered no deprivation of liberty resulting from injury to his reputation.",
+      "Paul v. Clinton was a civil suit filed in 2004 held in Los Angeles County Superior Court."
+    ]
+  },
+  {
+    "dataset": "hotpotqa_supporting_facts",
+    "quality": "gold",
+    "question": "Adrianus Jacobus Zuyderland was Vincent van Gogh's favorite model during his Hague period, he appears in dozens of drawings, easily identified by his bald head and prominent white whiskers, and he was the model for the drawing which was the basis for At Eternity's Gate, an oil painting by Vincent van Gogh that he made in which year, in Saint-Rémy de Provence based on an early lithograph?",
+    "positive_sentence": "Sorrowing Old Man (At Eternity's Gate) is an oil painting by Vincent van Gogh that he made in 1890 in Saint-Rémy de Provence based on an early lithograph.",
+    "negative_sentences": [
+      "Adrianus Jacobus Zuyderland was Vincent van Gogh's favorite model during his Hague period.",
+      "The early works of Vincent van Gogh is a group of paintings and drawings that Vincent van Gogh made when he was 27 and 28, in 1881 and 1882, his first two years of serious artistic exploration."
+    ]
+  }
+]

@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import argparse
 import json
 import random
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
 import torch
@@ -51,6 +51,10 @@ def evaluate(model: SpanClassifierMLP, loader: DataLoader, device: str) -> Tuple
     return total_loss / max(total, 1), correct / max(total, 1)
 
 
+def save_json(path: Path, payload: Any) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_file", type=str, required=True)
@@ -59,15 +63,17 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--dev_ratio", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     rows = load_jsonl(Path(args.train_file))
     X, y = build_xy(rows)
-    X_train, y_train, X_dev, y_dev = split_train_dev(X, y, args.dev_ratio)
+    X_train, y_train, X_dev, y_dev = split_train_dev(X, y, args.dev_ratio, seed=args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
@@ -84,34 +90,91 @@ def main() -> None:
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    best_dev_loss = float("inf")
-    best_state = None
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        total_loss = 0.0
-        total = 0
-        for xb, yb in train_loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
-            optimizer.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
-            loss.backward()
-            optimizer.step()
-            total_loss += float(loss.item()) * xb.size(0)
-            total += int(xb.size(0))
-
-        train_loss = total_loss / max(total, 1)
-        dev_loss, dev_acc = evaluate(model, dev_loader, device)
-        if dev_loss < best_dev_loss:
-            best_dev_loss = dev_loss
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-
-        if epoch == 1 or epoch % 10 == 0 or epoch == args.epochs:
-            print(f"epoch={epoch:03d} train_loss={train_loss:.4f} dev_loss={dev_loss:.4f} dev_acc={dev_acc:.4f}")
-
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "last_checkpoint.pt"
+    history_path = output_dir / "training_history.json"
+    best_metrics_path = output_dir / "best_metrics.json"
+    best_model_path = output_dir / "span_model.best.pt"
+
+    start_epoch = 1
+    best_dev_loss = float("inf")
+    best_state = None
+    best_metrics: dict[str, Any] = {}
+    history: list[dict[str, float]] = []
+
+    if args.resume and checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_dev_loss = float(checkpoint.get("best_dev_loss", float("inf")))
+        best_state = checkpoint.get("best_state")
+        best_metrics = checkpoint.get("best_metrics", {})
+        history = checkpoint.get("history", [])
+        print(f"resuming from epoch={start_epoch:03d} best_dev_loss={best_dev_loss:.4f}")
+
+    if start_epoch > args.epochs:
+        print(f"nothing to do: start_epoch={start_epoch:03d} exceeds epochs={args.epochs:03d}")
+    else:
+        for epoch in range(start_epoch, args.epochs + 1):
+            model.train()
+            total_loss = 0.0
+            total = 0
+            for xb, yb in train_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                optimizer.zero_grad()
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+                total_loss += float(loss.item()) * xb.size(0)
+                total += int(xb.size(0))
+
+            train_loss = total_loss / max(total, 1)
+            dev_loss, dev_acc = evaluate(model, dev_loader, device)
+            history.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": float(train_loss),
+                    "dev_loss": float(dev_loss),
+                    "dev_acc": float(dev_acc),
+                }
+            )
+
+            if dev_loss < best_dev_loss:
+                best_dev_loss = dev_loss
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                best_metrics = {
+                    "epoch": epoch,
+                    "train_loss": float(train_loss),
+                    "dev_loss": float(dev_loss),
+                    "dev_acc": float(dev_acc),
+                    "device": device,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "num_examples": int(len(rows)),
+                    "train_size": int(len(X_train)),
+                    "dev_size": int(len(X_dev)),
+                }
+                torch.save(best_state, best_model_path)
+
+            checkpoint_payload = {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "best_dev_loss": best_dev_loss,
+                "best_state": best_state,
+                "best_metrics": best_metrics,
+                "history": history,
+                "args": vars(args),
+            }
+            torch.save(checkpoint_payload, checkpoint_path)
+            save_json(history_path, history)
+            save_json(best_metrics_path, best_metrics)
+            print(f"epoch={epoch:03d} train_loss={train_loss:.4f} dev_loss={dev_loss:.4f} dev_acc={dev_acc:.4f}", flush=True)
+
     if best_state is not None:
         model.load_state_dict(best_state)
     torch.save(model.state_dict(), output_dir / "span_model.pt")
@@ -120,6 +183,10 @@ def main() -> None:
 
     print("saved:", output_dir / "span_model.pt")
     print("saved:", output_dir / "metadata.json")
+    if best_model_path.exists():
+        print("saved:", best_model_path)
+    if best_metrics:
+        print("best_dev_loss=", f"{best_dev_loss:.4f}")
 
 
 if __name__ == "__main__":

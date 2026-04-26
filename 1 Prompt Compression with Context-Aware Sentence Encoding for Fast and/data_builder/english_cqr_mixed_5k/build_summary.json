@@ -1,0 +1,100 @@
+{
+  "target_total": 5000,
+  "actual_total": 5000,
+  "deduped_removed": 1,
+  "source_counts": {
+    "longbench_multifieldqa_en": 99,
+    "wikitext103_pseudo_cqr": 800,
+    "hotpotqa_supporting_facts": 1801,
+    "cqr_official": 2000,
+    "longbench_qasper": 100,
+    "longbench_2wikimqa": 100,
+    "longbench_hotpotqa": 100
+  },
+  "quality_counts": {
+    "silver": 1199,
+    "gold": 3801
+  },
+  "split_summary": {
+    "train": {
+      "num_rows": 4523,
+      "dataset_counts": {
+        "longbench_multifieldqa_en": 89,
+        "wikitext103_pseudo_cqr": 746,
+        "hotpotqa_supporting_facts": 1618,
+        "cqr_official": 1800,
+        "longbench_qasper": 90,
+        "longbench_2wikimqa": 90,
+        "longbench_hotpotqa": 90
+      },
+      "quality_counts": {
+        "silver": 1105,
+        "gold": 3418
+      }
+    },
+    "dev": {
+      "num_rows": 233,
+      "dataset_counts": {
+        "longbench_multifieldqa_en": 5,
+        "wikitext103_pseudo_cqr": 26,
+        "hotpotqa_supporting_facts": 87,
+        "cqr_official": 100,
+        "longbench_qasper": 5,
+        "longbench_2wikimqa": 5,
+        "longbench_hotpotqa": 5
+      },
+      "quality_counts": {
+        "silver": 46,
+        "gold": 187
+      }
+    },
+    "test": {
+      "num_rows": 244,
+      "dataset_counts": {
+        "longbench_multifieldqa_en": 5,
+        "wikitext103_pseudo_cqr": 28,
+        "hotpotqa_supporting_facts": 96,
+        "cqr_official": 100,
+        "longbench_qasper": 5,
+        "longbench_2wikimqa": 5,
+        "longbench_hotpotqa": 5
+      },
+      "quality_counts": {
+        "silver": 48,
+        "gold": 196
+      }
+    }
+  },
+  "context_tokens": {
+    "min": 19,
+    "max": 14505,
+    "avg": 1766.54
+  },
+  "build_args": {
+    "output_dir": "data_builder\\english_cqr_mixed_5k",
+    "cache_dir": "D:\\python_project\\LittleEssay1\\hf_cache",
+    "target_total": 5000,
+    "cqr_rows": 2000,
+    "hotpotqa_rows": 1800,
+    "longbench_rows": 400,
+    "wikitext_rows": 800,
+    "longbench_datasets": [
+      "hotpotqa",
+      "2wikimqa",
+      "multifieldqa_en",
+      "qasper"
+    ],
+    "max_negatives": 4,
+    "min_negatives": 2,
+    "train_ratio": 0.9,
+    "dev_ratio": 0.05,
+    "test_ratio": 0.05,
+    "seed": 42
+  },
+  "source_build_counts_before_dedupe": {
+    "cqr_official": 2000,
+    "hotpotqa_supporting_facts": 1800,
+    "longbench_structure": 400,
+    "wikitext103_pseudo_cqr": 800
+  }
+}

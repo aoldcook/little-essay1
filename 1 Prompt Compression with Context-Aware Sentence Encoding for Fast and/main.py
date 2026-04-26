@@ -1,46 +1,131 @@
 ﻿from pathlib import Path
 
-from pipeline.compression_pipeline import ContextAwareCompressor
+from context_aware_encoder_model.context_aware_sentence_encoder import default_hf_cache_dir
+from pipeline.compression_pipeline import ContextAwareCompressor, estimate_token_count
+
 
 project_root = Path(__file__).resolve().parent
-span_model_dir = project_root / "intra_sentence_model" / "outputs"
-if not span_model_dir.exists():
-    span_model_dir = project_root / "intra_sentence_model" / "outputs_demo"
+hf_cache_dir = default_hf_cache_dir()
+
+local_encoder = project_root / "context_aware_encoder_model" / "outputs_english" / "stage2_full"
+qwen_cache = Path(hf_cache_dir) / "models--Qwen--Qwen3-Embedding-8B"
+
+def _find_complete_qwen_snapshot(cache_root):
+    required_files = (
+        "config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "model.safetensors.index.json",
+        "model-00001-of-00004.safetensors",
+        "model-00002-of-00004.safetensors",
+        "model-00003-of-00004.safetensors",
+        "model-00004-of-00004.safetensors",
+    )
+    for snapshot_dir in (cache_root / "snapshots").glob("*"):
+        if not snapshot_dir.is_dir():
+            continue
+        try:
+            if all((snapshot_dir / name).is_file() and (snapshot_dir / name).stat().st_size > 0 for name in required_files):
+                return snapshot_dir
+        except OSError:
+            continue
+    return None
+
+
+qwen_snapshot = _find_complete_qwen_snapshot(qwen_cache)
+if (local_encoder / "encoder_config.json").exists():
+    encoder_source = str(local_encoder)
+elif qwen_snapshot is not None:
+    encoder_source = str(qwen_snapshot)
+else:
+    encoder_source = "lightweight_lexical_fallback"
+
+budget_model = project_root / "target_ratio_model" / "outputs_english"
+budget_model_dir = str(budget_model) if (budget_model / "metadata.json").exists() else None
+
+span_model = project_root / "intra_sentence_model" / "outputs_english_feedback"
+span_model_dir = str(span_model) if (span_model / "metadata.json").exists() else None
 
 compressor = ContextAwareCompressor(
-    encoder_dir=str(project_root / "context_aware_encoder_model" / "outputs_mntp"),
-    budget_model_dir=str(project_root / "target_ratio_model" / "outputs"),
-    span_model_dir=str(span_model_dir),
+    encoder_dir=encoder_source,
+    encoder_cache_dir=hf_cache_dir,
+    budget_model_dir=budget_model_dir,
+    budget_formula_name="entropy_spread",
+    span_model_dir=span_model_dir,
     use_attention_probe=True,
-    attention_probe_weight=0.25,
-    task_reward_weight=0.15,
+    attention_probe_weight=0.18,
+    task_reward_weight=0.16,
+    use_task_descriptor=True,
+    task_descriptor_weight=0.14,
+    use_sentence_dynamics=True,
+    dynamic_attention_weight=0.12,
+    information_density_weight=0.10,
+    enable_linguistic_features=True,
+    linguistic_feature_weight=0.18,
     enable_second_stage=True,
-    second_stage_keep_ratio=0.5,
+    second_stage_keep_ratio=0.52,
+    second_stage_min_keep_ratio=0.34,
+    second_stage_max_keep_ratio=0.72,
+    allow_heuristic_fallback=True,
 )
 
-question = "CPC为什么能提升压缩效果？"
+question = "Why is the 1.5 degrees Celsius warming threshold considered a critical climate tipping point?"
 long_context = """
-近年来，大语言模型（Large Language Models, LLMs）在自然语言处理领域取得了突破性进展。从早期的BERT、GPT系列，到如今的LLaMA、ChatGLM、Qwen等开源或闭源模型，其参数规模和推理能力不断提升。然而，随着模型能力的增强，对计算资源的需求也急剧上升，尤其是在处理长上下文输入时，推理延迟和显存占用成为实际部署中的主要瓶颈。
-为应对这一挑战，研究者提出了多种优化策略。其中，上下文压缩（Context Compression）技术因其无需修改模型结构而备受关注。典型方法包括基于重要性评分的token剪枝（如LLMLingua）、利用小型代理模型进行摘要（如In-Context Learning with Summarization），以及最近提出的基于句子级选择的上下文感知压缩（CPC）。CPC方法通过训练一个专门的句子编码器，评估每个句子在特定问题下的相关性，并保留高分句子以重构压缩后的上下文，从而在保持回答质量的同时显著降低输入长度。
-值得注意的是，CPC的有效性高度依赖于其训练数据的质量。论文作者构建了一个名为CQR（Context-aware Question-Relevance）的新数据集，该数据集要求正样本句子虽不直接包含答案，但能提供关键上下文线索，而负样本则需经严格验证确保完全无关。这种设计使得模型能够学习到更精细的语义依赖关系，而非简单的关键词匹配。
-此外，压缩策略还需考虑下游任务的特性。例如，在问答任务中，保留包含实体、动作或因果关系的句子更为重要；而在摘要任务中，则需兼顾信息覆盖度与连贯性。因此，理想的压缩系统应具备任务自适应能力，甚至能根据输入动态调整压缩率——例如，对于信息密集的科研论文采用较低压缩比，而对于冗余较多的会议记录则可大幅裁剪。
-尽管已有诸多进展，当前方法仍面临若干挑战：一是如何在极高压缩比（如保留10%内容）下维持语义完整性；二是如何将压缩过程与LLM的内部注意力机制对齐，以最小化信息损失；三是缺乏统一的评估基准，导致不同方法间难以公平比较。未来的研究或将结合强化学习、知识蒸馏或可微分压缩等方向，进一步提升效率与效果的平衡。
+Global warming is driven primarily by human greenhouse gas emissions from fossil fuel combustion, land-use change, and industrial agriculture. The Intergovernmental Panel on Climate Change reports that warming beyond 1.5 degrees Celsius sharply increases the probability of irreversible ecological tipping points. These risks include accelerated ice-sheet loss, thawing permafrost that releases methane, severe coral reef decline, and stress on food and water systems. The Paris Agreement asks countries to pursue efforts to limit warming to 1.5 degrees Celsius, but current policies remain insufficient. Some mitigation strategies include renewable energy deployment, methane reduction, carbon capture, and nature-based restoration.
 """
 
 result = compressor.compress(question=question, context=long_context)
 
+print("encoder_source:", encoder_source)
+print("encoder_runtime:", compressor.encoder_runtime)
+if compressor.encoder_load_error:
+    print("encoder_load_error:", compressor.encoder_load_error.splitlines()[-1][:300])
+print("hf_cache_dir:", hf_cache_dir)
+print("span_model_dir:", span_model_dir)
+if compressor.span_compressor is not None:
+    print("learned_span_model_active:", compressor.span_compressor.learned_span_model is not None)
+    print("learned_keep_weight:", compressor.span_compressor.config.learned_keep_weight)
+    print("learned_soft_protected_threshold:", compressor.span_compressor.config.learned_soft_protected_threshold)
 print("target_ratio:", result["target_ratio"])
+print("budget_formula:", result["budget_formula"])
 print("selected_indices:", result["selected_indices"])
+original_tokens = sum(estimate_token_count(sentence) for sentence in result["sentences"])
+stage1_tokens = sum(estimate_token_count(sentence) for sentence in result["selected_sentences"])
+stage2_tokens = sum(estimate_token_count(sentence) for sentence in result["compressed_sentences"])
+print("original_tokens:", original_tokens)
+print("stage1_tokens:", stage1_tokens)
+print("stage2_tokens:", stage2_tokens)
+print("stage1_ratio:", round(stage1_tokens / max(original_tokens, 1), 3))
+print("final_ratio:", round(stage2_tokens / max(original_tokens, 1), 3))
+print("task_descriptor:", result["task_descriptor"])
 print("semantic_similarities:", result["semantic_similarities"])
 print("attention_probe_scores:", result["attention_probe_scores"])
+print("dynamic_attention_scores:", result["dynamic_attention_scores"])
+print("information_density_scores:", result["information_density_scores"])
+print("linguistic_scores:", result["linguistic_scores"])
 print("task_rewards:", result["task_rewards"])
+print("task_descriptor_scores:", result["task_descriptor_scores"])
 print("selection_scores:", result["selection_scores"])
+print("linguistic_features:")
+for feature in result["linguistic_features"]:
+    print(feature)
 print("removed_span_count:", result["second_stage_stats"]["removed_span_count"])
+print("stage1_context:")
+print(result["stage1_context"])
 print("compressed_context:")
 print(result["compressed_context"])
-print("original_sentence_count:", len(long_context.split("。")))
+print("original_sentence_count:", len(result["sentences"]))
 print("stage1_sentence_count:", len(result["selected_sentences"]))
 print("stage2_sentence_count:", len(result["compressed_sentences"]))
 
+for idx, sentence in enumerate(result["selected_sentences"], start=1):
+    print(f"stage1_sentence_{idx}:", sentence)
+
 for idx, sentence_stat in enumerate(result["second_stage_stats"]["sentence_stats"], start=1):
+    print(f"stage2_sentence_{idx}_compression_mode:", sentence_stat.get("compression_mode"))
     print(f"stage2_sentence_{idx}_removed_spans:", sentence_stat["removed_spans"])
+
+
+
+
+

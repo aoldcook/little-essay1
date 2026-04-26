@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 from pathlib import Path
 
@@ -9,7 +9,7 @@ from target_ratio_model.budget_model import BudgetConfig, BudgetPredictorMLP, cl
 
 
 def load_json(path: Path):
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -56,3 +56,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

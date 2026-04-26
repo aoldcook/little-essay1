@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 import random
 from pathlib import Path
@@ -18,7 +18,7 @@ from target_ratio_model.budget_model import (
 )
 
 
-DEFAULT_BUCKETS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+DEFAULT_BUCKETS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
 
 def load_jsonl(path: Path) -> List[dict]:
@@ -110,3 +110,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

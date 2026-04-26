@@ -1,9 +1,27 @@
 *.safetensors
+*.pt
+*.bin
+*.arrow
+*.zip
 __pycache__/
 *.pyc
 # Local artifacts
+hf_cache/
+pcase/
+external_refs/
+.idea/
 **/outputs_mntp/
 **/outputs_demo/
+**/outputs/
+**/outputs_*/
+**/benchmark_outputs*/
+**/english_cqr_mixed_5k/*.jsonl
 **/sample_span_pseudo.jsonl
+**/span_pseudo_*.jsonl
+**/english_budget_train.jsonl
+**/english_ratio_inputs.jsonl
+**/formula_ratio_synthetic_cases.jsonl
 **/cleaned_test/
 tmp_*.txt
+tmp_*.log
+project_source_guide.docx

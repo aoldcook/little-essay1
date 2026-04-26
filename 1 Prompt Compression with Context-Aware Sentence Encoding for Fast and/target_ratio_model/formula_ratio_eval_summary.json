@@ -1,0 +1,61 @@
+{
+  "num_cases": 160,
+  "seed": 42,
+  "best_formula": "entropy_spread",
+  "metrics": {
+    "entropy_spread": {
+      "success_rate": 0.95,
+      "under_budget_rate": 0.05,
+      "mean_pred_ratio": 0.8087500000000001,
+      "mean_oracle_ratio": 0.46875,
+      "mean_excess_ratio": 0.34562499999999996,
+      "mean_abs_error": 0.35125,
+      "mean_coverage": 0.9858796296296296
+    },
+    "top_gap": {
+      "success_rate": 0.8875,
+      "under_budget_rate": 0.1125,
+      "mean_pred_ratio": 0.7006249999999999,
+      "mean_oracle_ratio": 0.46875,
+      "mean_excess_ratio": 0.24937499999999999,
+      "mean_abs_error": 0.266875,
+      "mean_coverage": 0.9636468855218855
+    },
+    "length_density": {
+      "success_rate": 0.90625,
+      "under_budget_rate": 0.09375,
+      "mean_pred_ratio": 0.7793749999999999,
+      "mean_oracle_ratio": 0.46875,
+      "mean_excess_ratio": 0.32375000000000004,
+      "mean_abs_error": 0.33687500000000004,
+      "mean_coverage": 0.9683922558922557
+    },
+    "linguistic_complexity": {
+      "success_rate": 0.94375,
+      "under_budget_rate": 0.05625,
+      "mean_pred_ratio": 0.8143750000000001,
+      "mean_oracle_ratio": 0.46875,
+      "mean_excess_ratio": 0.35250000000000004,
+      "mean_abs_error": 0.359375,
+      "mean_coverage": 0.98309132996633
+    },
+    "evidence_floor": {
+      "success_rate": 0.85625,
+      "under_budget_rate": 0.14375,
+      "mean_pred_ratio": 0.69875,
+      "mean_oracle_ratio": 0.46875,
+      "mean_excess_ratio": 0.26125,
+      "mean_abs_error": 0.2925,
+      "mean_coverage": 0.9484848484848485
+    },
+    "hybrid_li_dac": {
+      "success_rate": 0.93125,
+      "under_budget_rate": 0.06875,
+      "mean_pred_ratio": 0.79375,
+      "mean_oracle_ratio": 0.46875,
+      "mean_excess_ratio": 0.335,
+      "mean_abs_error": 0.34500000000000003,
+      "mean_coverage": 0.9793876262626261
+    }
+  }
+}

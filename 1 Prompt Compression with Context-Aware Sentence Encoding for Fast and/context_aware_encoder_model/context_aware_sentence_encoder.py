@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Sequence, Tuple
 
 import torch
@@ -10,42 +12,69 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 
+DEFAULT_STAGE1_MODEL = "Qwen/Qwen3-Embedding-8B"
+DEFAULT_QUERY_INSTRUCTION = "Given a question, retrieve context sentences that contain evidence needed to answer it."
+
+
+def default_hf_cache_dir() -> str:
+    return str(Path(__file__).resolve().parents[2] / "hf_cache")
+
+
 @dataclass
 class ContextAwareEncoderConfig:
-    model_name: str = "bert-base-chinese"
-    max_length: int = 512
+    model_name: str = DEFAULT_STAGE1_MODEL
+    max_length: int = 1024
     temperature: float = 0.05
     device: str = "cuda"
     marker_start: str = "<sent_start>"
     marker_end: str = "<sent_end>"
+    cache_dir: str = ""
+    trust_remote_code: bool = True
+    pooling_strategy: str = "last_token"
+    query_instruction: str = DEFAULT_QUERY_INSTRUCTION
 
 
 class ContextAwareSentenceEncoder(nn.Module):
-    """
-    一个最小可用的上下文感知句子编码器：
-    - 问题单独编码得到 query embedding
-    - 对“带 marker 的上下文”编码
-    - 在 marker 圈出的 span 上做平均池化
-    - 得到 sentence-in-context embedding
-    """
-
     def __init__(self, config: ContextAwareEncoderConfig):
         super().__init__()
         self.config = config
 
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        self.tokenizer.add_special_tokens(
+        cache_dir = config.cache_dir or default_hf_cache_dir()
+        os.environ.setdefault("HF_HOME", cache_dir)
+        os.environ.setdefault("HF_HUB_CACHE", str(Path(cache_dir) / "hub"))
+        os.environ.setdefault("TRANSFORMERS_CACHE", str(Path(cache_dir) / "transformers"))
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name,
+            cache_dir=cache_dir,
+            trust_remote_code=config.trust_remote_code,
+            padding_side="left",
+        )
+        added_tokens = 0
+        if self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                added_tokens += self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
+        added_tokens += self.tokenizer.add_special_tokens(
             {"additional_special_tokens": [config.marker_start, config.marker_end]}
         )
 
         try:
             self.encoder = AutoModel.from_pretrained(
                 config.model_name,
+                cache_dir=cache_dir,
+                trust_remote_code=config.trust_remote_code,
                 attn_implementation="eager",
             )
         except TypeError:
-            self.encoder = AutoModel.from_pretrained(config.model_name)
-        self.encoder.resize_token_embeddings(len(self.tokenizer))
+            self.encoder = AutoModel.from_pretrained(
+                config.model_name,
+                cache_dir=cache_dir,
+                trust_remote_code=config.trust_remote_code,
+            )
+        if added_tokens > 0:
+            self.encoder.resize_token_embeddings(len(self.tokenizer))
 
         self.start_id = self.tokenizer.convert_tokens_to_ids(config.marker_start)
         self.end_id = self.tokenizer.convert_tokens_to_ids(config.marker_end)
@@ -54,23 +83,30 @@ class ContextAwareSentenceEncoder(nn.Module):
         self.to(self.device)
 
     def mean_pool(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """
-        hidden_states: [B, L, H]
-        attention_mask: [B, L]
-        return: [B, H]
-        """
-        mask = attention_mask.unsqueeze(-1).float()  # [B, L, 1]
-        summed = torch.sum(hidden_states * mask, dim=1)  # [B, H]
-        denom = torch.clamp(mask.sum(dim=1), min=1e-9)  # [B, 1]
+        mask = attention_mask.unsqueeze(-1).float()
+        summed = torch.sum(hidden_states * mask, dim=1)
+        denom = torch.clamp(mask.sum(dim=1), min=1e-9)
         return summed / denom
 
+    def last_token_pool(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        left_padding = bool((attention_mask[:, -1].sum() == attention_mask.shape[0]).item())
+        if left_padding:
+            return hidden_states[:, -1]
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_size = hidden_states.shape[0]
+        return hidden_states[torch.arange(batch_size, device=hidden_states.device), sequence_lengths]
+
+    def format_query(self, question: str) -> str:
+        if not self.config.query_instruction:
+            return question
+        if question.lstrip().lower().startswith("instruct:"):
+            return question
+        return f"Instruct: {self.config.query_instruction}\nQuery: {question}"
+
     def encode_question(self, questions: Sequence[str]) -> torch.Tensor:
-        """
-        对问题做编码，输出归一化后的 query embedding。
-        return: [B, H]
-        """
+        encoded_questions = [self.format_query(question) for question in questions]
         batch = self.tokenizer(
-            list(questions),
+            encoded_questions,
             padding=True,
             truncation=True,
             max_length=self.config.max_length,
@@ -78,30 +114,25 @@ class ContextAwareSentenceEncoder(nn.Module):
         ).to(self.device)
 
         outputs = self.encoder(**batch)
-        pooled = self.mean_pool(outputs.last_hidden_state, batch["attention_mask"])
+        if self.config.pooling_strategy == "last_token":
+            pooled = self.last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
+        else:
+            pooled = self.mean_pool(outputs.last_hidden_state, batch["attention_mask"])
         return F.normalize(pooled, p=2, dim=1)
 
     def _find_marker_span(self, input_ids: torch.Tensor) -> Tuple[int, int]:
-        """
-        在 token id 序列中找到 <sent_start> 和 <sent_end> 之间的 span。
-        返回值是 [start, end) 风格，不包含 marker 本身。
-        """
         ids = input_ids.detach().cpu().tolist()
         try:
             start_pos = ids.index(self.start_id)
             end_pos = ids.index(self.end_id)
         except ValueError as exc:
             raise ValueError(
-                "marker tokens not found in input_ids; "
-                "most likely the marked context was truncated because it is too long. "
-                "Please use a shorter local context window."
+                "marker tokens not found in input_ids; the marked context was probably truncated. "
+                "Use a shorter local context window or raise max_length."
             ) from exc
 
         if end_pos <= start_pos + 1:
-            raise ValueError(
-                "invalid marker span: end marker appears before start marker "
-                "or the sentence span is empty."
-            )
+            raise ValueError("invalid marker span: end marker appears before start marker or the span is empty")
         return start_pos + 1, end_pos
 
     def encode_marked_contexts(
@@ -109,12 +140,9 @@ class ContextAwareSentenceEncoder(nn.Module):
         questions: Sequence[str],
         marked_contexts: Sequence[str],
     ) -> torch.Tensor:
-        """
-        编码 (question, marked_context) 对，并提取 marker 内句子的上下文感知表示。
-        return: [B, H]
-        """
+        encoded_questions = [self.format_query(question) for question in questions]
         batch = self.tokenizer(
-            list(questions),
+            encoded_questions,
             list(marked_contexts),
             padding=True,
             truncation=True,
@@ -123,16 +151,20 @@ class ContextAwareSentenceEncoder(nn.Module):
         ).to(self.device)
 
         outputs = self.encoder(**batch)
-        hidden = outputs.last_hidden_state  # [B, L, H]
+        hidden = outputs.last_hidden_state
 
         sent_vecs = []
-        for b in range(hidden.size(0)):
-            start, end = self._find_marker_span(batch["input_ids"][b])
-            span_hidden = hidden[b, start:end, :]  # [span_len, H]
-            sent_vec = span_hidden.mean(dim=0)     # [H]
+        for batch_idx in range(hidden.size(0)):
+            try:
+                start, end = self._find_marker_span(batch["input_ids"][batch_idx])
+                span_hidden = hidden[batch_idx, start:end, :]
+                sent_vec = span_hidden.mean(dim=0)
+            except ValueError:
+                mask = batch["attention_mask"][batch_idx].unsqueeze(-1).float()
+                sent_vec = torch.sum(hidden[batch_idx] * mask, dim=0) / torch.clamp(mask.sum(), min=1e-9)
             sent_vecs.append(sent_vec)
 
-        sent_vecs = torch.stack(sent_vecs, dim=0)  # [B, H]
+        sent_vecs = torch.stack(sent_vecs, dim=0)
         return F.normalize(sent_vecs, p=2, dim=1)
 
     @torch.no_grad()
@@ -142,23 +174,17 @@ class ContextAwareSentenceEncoder(nn.Module):
         sentences: Sequence[str],
         marked_contexts: Sequence[str],
     ) -> Tuple[List[float], torch.Tensor]:
-        """
-        给一个问题和多个句子打分。
-        返回：
-        - similarities: List[float]
-        - sentence_embeddings: [N, H]
-        """
         if len(sentences) != len(marked_contexts):
             raise ValueError(
                 f"len(sentences)={len(sentences)} but len(marked_contexts)={len(marked_contexts)}"
             )
 
         self.eval()
-
-        q_emb = self.encode_question([question])  # [1, H]
-        s_emb = self.encode_marked_contexts([question] * len(marked_contexts), marked_contexts)  # [N, H]
-
-        sims = torch.matmul(q_emb, s_emb.T).squeeze(0)  # [N]
+        if not sentences:
+            return [], torch.empty((0, 0))
+        q_emb = self.encode_question([question])
+        s_emb = self.encode_marked_contexts([question] * len(marked_contexts), marked_contexts)
+        sims = torch.matmul(q_emb, s_emb.T).squeeze(0)
         return sims.detach().cpu().tolist(), s_emb.detach().cpu()
 
     @torch.no_grad()
@@ -172,8 +198,9 @@ class ContextAwareSentenceEncoder(nn.Module):
             return []
 
         self.eval()
+        encoded_question = self.format_query(question)
         batch = self.tokenizer(
-            [question] * len(marked_contexts),
+            [encoded_question] * len(marked_contexts),
             list(marked_contexts),
             padding=True,
             truncation=True,
@@ -191,16 +218,20 @@ class ContextAwareSentenceEncoder(nn.Module):
         special_ids = set(getattr(self.tokenizer, "all_special_ids", []))
 
         scores: List[float] = []
-        for b in range(mean_attention.size(0)):
-            start, end = self._find_marker_span(batch["input_ids"][b])
+        for batch_idx in range(mean_attention.size(0)):
+            try:
+                start, end = self._find_marker_span(batch["input_ids"][batch_idx])
+            except ValueError:
+                scores.append(0.0)
+                continue
             span_indices = list(range(start, end))
             valid_indices = [
                 idx
-                for idx, input_id in enumerate(batch["input_ids"][b].detach().cpu().tolist())
-                if int(batch["attention_mask"][b, idx].item()) == 1 and input_id not in special_ids
+                for idx, input_id in enumerate(batch["input_ids"][batch_idx].detach().cpu().tolist())
+                if int(batch["attention_mask"][batch_idx, idx].item()) == 1 and input_id not in special_ids
             ]
             if "token_type_ids" in batch:
-                question_indices = [idx for idx in valid_indices if int(batch["token_type_ids"][b, idx].item()) == 0]
+                question_indices = [idx for idx in valid_indices if int(batch["token_type_ids"][batch_idx, idx].item()) == 0]
             else:
                 question_indices = [idx for idx in valid_indices if idx < start]
 
@@ -208,8 +239,8 @@ class ContextAwareSentenceEncoder(nn.Module):
                 scores.append(0.0)
                 continue
 
-            q_to_span = float(mean_attention[b, question_indices][:, span_indices].mean().item())
-            global_to_span = float(mean_attention[b, valid_indices][:, span_indices].mean().item())
+            q_to_span = float(mean_attention[batch_idx, question_indices][:, span_indices].mean().item())
+            global_to_span = float(mean_attention[batch_idx, valid_indices][:, span_indices].mean().item())
             scores.append(0.7 * q_to_span + 0.3 * global_to_span)
 
         return scores
@@ -220,41 +251,103 @@ class ContextAwareSentenceEncoder(nn.Module):
         positive_marked_contexts: Sequence[str],
         negative_marked_contexts: Sequence[Sequence[str]],
     ) -> torch.Tensor:
-        """
-        一个最小可用的 InfoNCE 对比学习损失：
-        - query 更接近正样本句
-        - query 远离负样本句
-        """
         if len(questions) != len(positive_marked_contexts):
             raise ValueError("questions and positive_marked_contexts must have the same length")
 
-        q_emb = self.encode_question(questions)  # [B, H]
-        pos_emb = self.encode_marked_contexts(questions, positive_marked_contexts)  # [B, H]
+        q_emb = self.encode_question(questions)
+        pos_emb = self.encode_marked_contexts(questions, positive_marked_contexts)
 
         flat_neg_questions: List[str] = []
         flat_neg_contexts: List[str] = []
-        for q, negs in zip(questions, negative_marked_contexts):
+        for question, negs in zip(questions, negative_marked_contexts):
             for neg in negs:
-                flat_neg_questions.append(q)
+                flat_neg_questions.append(question)
                 flat_neg_contexts.append(neg)
 
-        if len(flat_neg_contexts) > 0:
-            neg_emb = self.encode_marked_contexts(flat_neg_questions, flat_neg_contexts)  # [K, H]
-            candidates = torch.cat([pos_emb, neg_emb], dim=0)  # [B+K, H]
+        if flat_neg_contexts:
+            neg_emb = self.encode_marked_contexts(flat_neg_questions, flat_neg_contexts)
+            candidates = torch.cat([pos_emb, neg_emb], dim=0)
         else:
             candidates = pos_emb
 
-        logits = torch.matmul(q_emb, candidates.T) / self.config.temperature  # [B, B+K]
-        targets = torch.arange(len(questions), device=self.device)  # 正样本在前 B 个候选中的第 i 个
+        logits = torch.matmul(q_emb, candidates.T) / self.config.temperature
+        targets = torch.arange(len(questions), device=self.device)
         return F.cross_entropy(logits, targets)
 
 
 def split_sentences(text: str) -> List[str]:
-    """
-    中英混合的基础切句函数。
-    """
-    sentences = re.split(r"(?<=[。！？.!?])\s*", text.strip())
-    return [s.strip() for s in sentences if s.strip()]
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    sentences: List[str] = []
+    current: List[str] = []
+    length = len(stripped)
+    abbreviations = {
+        "dr",
+        "mr",
+        "mrs",
+        "ms",
+        "prof",
+        "inc",
+        "ltd",
+        "fig",
+        "e.g",
+        "i.e",
+        "vs",
+        "u.s",
+        "u.k",
+    }
+
+    for idx, ch in enumerate(stripped):
+        current.append(ch)
+        if ch not in ".!?;":
+            continue
+
+        prev_char = stripped[idx - 1] if idx > 0 else ""
+        next_char = stripped[idx + 1] if idx + 1 < length else ""
+        if ch == ".":
+            if prev_char.isdigit() and next_char.isdigit():
+                continue
+            prefix = "".join(current).strip().split()[-1].rstrip(".").lower() if current else ""
+            if prefix in abbreviations:
+                continue
+            if next_char and next_char.islower():
+                continue
+
+        sentence = "".join(current).strip()
+        if sentence:
+            sentences.append(sentence)
+        current = []
+
+    tail = "".join(current).strip()
+    if tail:
+        sentences.append(tail)
+
+    return sentences
+
+
+def normalize_sentence_for_match(text: str) -> str:
+    compact = re.sub(r"\s+", " ", text.strip().lower())
+    return re.sub(r"[.!?;:]+$", "", compact)
+
+
+def find_target_sentence_index(sentences: Sequence[str], target_sentence: str) -> int:
+    target_norm = normalize_sentence_for_match(target_sentence)
+    if not target_norm:
+        return -1
+
+    normalized_sentences = [normalize_sentence_for_match(sentence) for sentence in sentences]
+
+    for index, sentence_norm in enumerate(normalized_sentences):
+        if sentence_norm == target_norm:
+            return index
+
+    for index, sentence_norm in enumerate(normalized_sentences):
+        if sentence_norm and (sentence_norm in target_norm or target_norm in sentence_norm):
+            return index
+
+    return -1
 
 
 def build_marked_context(
@@ -263,17 +356,13 @@ def build_marked_context(
     marker_start: str,
     marker_end: str,
 ) -> str:
-    """
-    直接使用完整句子列表构造带 marker 的上下文：
-    例如：A <sent_start>B</sent_end> C
-    """
     parts = []
-    for idx, s in enumerate(sentences):
+    for idx, sentence in enumerate(sentences):
         if idx == target_index:
-            parts.append(f"{marker_start}{s}{marker_end}")
+            parts.append(f"{marker_start}{sentence}{marker_end}")
         else:
-            parts.append(s)
-    return "".join(parts)
+            parts.append(sentence)
+    return " ".join(parts)
 
 
 def build_marked_context_window(
@@ -281,19 +370,8 @@ def build_marked_context_window(
     target_index: int,
     marker_start: str,
     marker_end: str,
-    max_chars: int = 220,
+    max_chars: int = 900,
 ) -> str:
-    """
-    只截取目标句附近的局部上下文窗口，避免完整上下文过长导致 marker 被截断。
-
-    逻辑：
-    - 一定保留目标句
-    - 然后从左右两侧逐步扩展
-    - 直到达到 max_chars 的字符预算
-
-    注意：
-    这里按“字符数”近似控制窗口大小，更适合中文最小可运行版本。
-    """
     if target_index < 0 or target_index >= len(sentences):
         raise IndexError(f"target_index out of range: {target_index}")
 
@@ -306,15 +384,15 @@ def build_marked_context_window(
     while True:
         added = False
 
-        if left >= 0 and total_len + len(sentences[left]) <= max_chars:
+        if left >= 0 and total_len + len(sentences[left]) + 1 <= max_chars:
             selected.insert(0, left)
-            total_len += len(sentences[left])
+            total_len += len(sentences[left]) + 1
             left -= 1
             added = True
 
-        if right < len(sentences) and total_len + len(sentences[right]) <= max_chars:
+        if right < len(sentences) and total_len + len(sentences[right]) + 1 <= max_chars:
             selected.append(right)
-            total_len += len(sentences[right])
+            total_len += len(sentences[right]) + 1
             right += 1
             added = True
 
@@ -323,12 +401,52 @@ def build_marked_context_window(
 
     parts = []
     for idx in selected:
-        s = sentences[idx]
+        sentence = sentences[idx]
         if idx == target_index:
-            s = f"{marker_start}{s}{marker_end}"
-        parts.append(s)
+            sentence = f"{marker_start}{sentence}{marker_end}"
+        parts.append(sentence)
 
-    return "".join(parts)
+    return " ".join(parts)
+
+
+def build_marked_context_from_span(
+    context: str,
+    start: int,
+    end: int,
+    marker_start: str,
+    marker_end: str,
+) -> str:
+    if start < 0 or end > len(context) or start >= end:
+        raise ValueError("invalid span for marker insertion")
+    return context[:start] + marker_start + context[start:end] + marker_end + context[end:]
+
+
+def build_marked_context_from_span_window(
+    context: str,
+    start: int,
+    end: int,
+    marker_start: str,
+    marker_end: str,
+    max_chars: int = 900,
+) -> str:
+    if start < 0 or end > len(context) or start >= end:
+        raise ValueError("invalid span for marker insertion")
+
+    span_text = context[start:end]
+    budget = max(max_chars - len(marker_start) - len(marker_end) - len(span_text), 0)
+    left_budget = budget // 2
+    right_budget = budget - left_budget
+
+    left_start = max(0, start - left_budget)
+    right_end = min(len(context), end + right_budget)
+
+    if left_start == 0:
+        right_end = min(len(context), right_end + (left_budget - (start - left_start)))
+    if right_end == len(context):
+        left_start = max(0, left_start - (right_budget - (right_end - end)))
+
+    local_context = context[left_start:start] + marker_start + span_text + marker_end + context[end:right_end]
+    return local_context.strip()
 
 
 def build_marked_context_from_text(
@@ -337,40 +455,55 @@ def build_marked_context_from_text(
     marker_start: str,
     marker_end: str,
     use_window: bool = False,
-    max_chars: int = 220,
+    max_chars: int = 900,
 ) -> str:
-    """
-    从原始文本和目标句文本出发构造带 marker 的上下文。
-
-    默认 use_window=False，保持和旧训练脚本兼容；
-    如果你后面想让训练和推理一致，可以改成 use_window=True。
-    """
     sentences = split_sentences(context)
-    target_norm = re.sub(r"\s+", "", target_sentence.strip())
+    target_index = find_target_sentence_index(sentences, target_sentence)
 
-    target_index = -1
-    for i, s in enumerate(sentences):
-        s_norm = re.sub(r"\s+", "", s.strip())
-        if s_norm == target_norm:
-            target_index = i
-            break
-
-    if target_index == -1:
-        raise ValueError("target_sentence not found in context after sentence splitting")
-
-    if use_window:
-        return build_marked_context_window(
+    if target_index != -1:
+        if use_window:
+            return build_marked_context_window(
+                sentences=sentences,
+                target_index=target_index,
+                marker_start=marker_start,
+                marker_end=marker_end,
+                max_chars=max_chars,
+            )
+        return build_marked_context(
             sentences=sentences,
             target_index=target_index,
             marker_start=marker_start,
             marker_end=marker_end,
-            max_chars=max_chars,
         )
 
-    return build_marked_context(
-        sentences=sentences,
-        target_index=target_index,
-        marker_start=marker_start,
-        marker_end=marker_end,
-    )
+    raw_target = target_sentence.strip()
+    fallback_candidates = []
+    if raw_target:
+        fallback_candidates.append(raw_target)
+    stripped_target = re.sub(r"[.!?;:]+$", "", raw_target)
+    if stripped_target and stripped_target not in fallback_candidates:
+        fallback_candidates.append(stripped_target)
+
+    for candidate in fallback_candidates:
+        start = context.find(candidate)
+        if start != -1:
+            end = start + len(candidate)
+            if use_window:
+                return build_marked_context_from_span_window(
+                    context=context,
+                    start=start,
+                    end=end,
+                    marker_start=marker_start,
+                    marker_end=marker_end,
+                    max_chars=max_chars,
+                )
+            return build_marked_context_from_span(
+                context=context,
+                start=start,
+                end=end,
+                marker_start=marker_start,
+                marker_end=marker_end,
+            )
+
+    raise ValueError("target_sentence not found in context after sentence splitting")
 

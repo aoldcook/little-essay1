@@ -1,50 +1,76 @@
-﻿# CPC 项目增强版
+﻿# English Prompt Compression for Downstream Black-box LLMs
 
-这个目录现在实现的是一个两级压缩原型：
+This project now targets English prompt/context compression for QA and RAG-style downstream black-box LLMs. The previous Chinese benchmark path and Stage-3 generative rewriting path have been removed from the active pipeline.
 
-1. 句子级压缩：`context-aware sentence encoder + learned budget + MMR selector`
-2. 句内压缩：`task-aware dynamic span compression`
+## Active Pipeline
 
-第二级压缩融合了四条思路：
+1. Stage-1: context-aware sentence selection
+   - Qwen3 embedding backbone by default: `Qwen/Qwen3-Embedding-8B`
+   - semantic sentence-query similarity
+   - attention probing
+   - task reward and task descriptor alignment
+   - DAC-inspired sentence dynamics: dynamic attention plus information-density scoring
+   - MMR selection under a token budget
 
-- `TACO-RL`：把任务相关奖励信号引入压缩决策
-- `DAC`：在句内做动态 attention-aware span 剪裁
-- `Sentinel`：用 proxy encoder attention 做轻量 probing
-- `Sentence-Anchored Gist Compression`：以句子/子句边界作为稳定压缩单元
+2. Stage-2: task-aware intra-sentence span pruning
+   - protected spans for entities, numbers, units, thresholds, negation, and answer-critical clauses
+   - English question type rules: cause, comparison, procedure, numeric, definition, factoid, other
+   - marginal-information-gain keep-ratio allocation
+   - optional learned span model
 
-## 目录说明
+Stage-3 generative recompression is no longer part of the active code path.
 
-- `context_aware_encoder_model/`: 句子级编码器与训练脚本
-- `target_ratio_model/`: 自适应预算预测器
-- `pipeline/`: 端到端压缩管线
-- `data_builder/`: CQR 风格数据构造脚本
-- `main.py`: 最小可运行示例
+## Storage
 
-## 直接运行
+Model cache defaults to:
+
+```bash
+D:\python_project\LittleEssay1\hf_cache
+```
+
+The code sets `HF_HOME`, `HF_HUB_CACHE`, and `TRANSFORMERS_CACHE` from `ContextAwareEncoderConfig.cache_dir` when the encoder loads.
+
+## Direct Demo
 
 ```bash
 python main.py
 ```
 
-运行后会输出：
+If no local English checkpoint exists under `context_aware_encoder_model/outputs_english/stage2_full`, the demo loads `Qwen/Qwen3-Embedding-8B` and caches it on D drive. Use a smaller compatible model if GPU memory is limited, for example `Qwen/Qwen3-Embedding-0.6B`.
 
-- `semantic_similarities`: 原始语义相关分数
-- `attention_probe_scores`: Sentinel 风格 attention probing 分数
-- `task_rewards`: TACO-RL 风格任务奖励信号
-- `selection_scores`: 句子级最终选择分数
-- `removed_span_count`: 第二阶段句内压缩删除的 span 数量
+## Build English CQR Data
 
-## 训练脚本
+Prepare raw JSON/JSONL files from English QA/RAG datasets, then run:
 
 ```bash
-python -m target_ratio_model.train_budget_predictor --train_file target_ratio_model/sample_budget_train.jsonl --output_dir target_ratio_model/outputs
-python -m target_ratio_model.predict_budget --model_dir target_ratio_model/outputs --input_json target_ratio_model/predict_input_example.json
-python -m context_aware_encoder_model.train_context_aware_encoder --train_file context_aware_encoder_model/sample_cqr_train.jsonl --output_dir context_aware_encoder_model/outputs
-python -m context_aware_encoder_model.train_context_aware_encoder_with_mntp --train_file context_aware_encoder_model/sample_cqr_train.jsonl --output_dir context_aware_encoder_model/outputs_mntp
+python -m data_builder.build_english_cqr_dataset ^
+  --input_file data_builder/source_english/longbench_hotpotqa.jsonl --dataset_name longbench_hotpotqa ^
+  --input_file data_builder/source_english/longbench_2wikimqa.jsonl --dataset_name longbench_2wikimqa ^
+  --input_file data_builder/source_english/longbench_musique.jsonl --dataset_name longbench_musique ^
+  --output_dir data_builder/english_cqr
 ```
 
-## 当前增强的核心入口
+Recommended sources:
 
-- `pipeline/compression_pipeline.py`: 两级压缩总入口
-- `pipeline/task_aware_compression.py`: 句内动态 span 压缩
-- `context_aware_encoder_model/context_aware_sentence_encoder.py`: attention probing 支持
+- LongBench: `hotpotqa`, `2wikimqa`, `musique`, `multifieldqa_en`, `qasper`, `narrativeqa`, `triviaqa`
+- HotpotQA, 2WikiMultiHopQA, MuSiQue, Qasper, Natural Questions, TriviaQA
+
+## Train
+
+```bash
+python -m context_aware_encoder_model.train_context_aware_encoder ^
+  --train_file data_builder/english_cqr/train.jsonl ^
+  --dev_file data_builder/english_cqr/dev.jsonl ^
+  --output_dir context_aware_encoder_model/outputs_english ^
+  --model_name Qwen/Qwen3-Embedding-8B ^
+  --cache_dir D:\python_project\LittleEssay1\hf_cache
+```
+
+For MLM/MNTP-style regularization, use an English masked-LM backbone such as `answerdotai/ModernBERT-base`; Qwen3 embedding models are the default for the plain Stage-1 encoder path.
+
+## Key Docs
+
+- `markdown/english_prompt_compression_experiment_plan.md`: revised experiment design, baselines, ablations, and paper mapping
+- `data_builder/build_english_cqr_dataset.py`: English CQR dataset construction
+- `pipeline/compression_pipeline.py`: two-stage compression entry point
+- `pipeline/task_aware_compression.py`: English span pruning logic

@@ -1,8 +1,0 @@
-{
-  "model_name": "bert-base-chinese",
-  "max_length": 512,
-  "temperature": 0.05,
-  "device": "cpu",
-  "marker_start": "<sent_start>",
-  "marker_end": "<sent_end>"
-}

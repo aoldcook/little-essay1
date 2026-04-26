@@ -1,85 +1,58 @@
-
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
+import os
 import json
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-
-def split_sentences(text: str) -> List[str]:
-    import re
-    sentences = re.split(r"(?<=[。！？.!?])\s*", text.strip())
-    return [s.strip() for s in sentences if s.strip()]
-
-
-def build_marked_context_from_text(
-    context: str,
-    target_sentence: str,
-    marker_start: str,
-    marker_end: str,
-) -> str:
-    sentences = split_sentences(context)
-    target_norm = target_sentence.strip().replace(" ", "")
-    target_idx = -1
-    for i, s in enumerate(sentences):
-        if s.strip().replace(" ", "") == target_norm:
-            target_idx = i
-            break
-    if target_idx == -1:
-        raise ValueError("target_sentence not found in context")
-
-    parts = []
-    for i, s in enumerate(sentences):
-        if i == target_idx:
-            parts.append(f"{marker_start}{s}{marker_end}")
-        else:
-            parts.append(s)
-    return "".join(parts)
+from context_aware_encoder_model.context_aware_sentence_encoder import default_hf_cache_dir
+from context_aware_encoder_model.cqr_train_eval import CQRDataset, collate_fn, evaluate_sentence_ranking
 
 
 @dataclass
 class MultiTaskEncoderConfig:
-    model_name: str = "bert-base-chinese"
+    model_name: str = 'answerdotai/ModernBERT-base'
     max_length: int = 512
     temperature: float = 0.05
     mlm_probability: float = 0.15
     lambda_mntp: float = 1.0
-    device: str = "cuda"
-    marker_start: str = "<sent_start>"
-    marker_end: str = "<sent_end>"
+    device: str = 'cuda'
+    marker_start: str = '<sent_start>'
+    marker_end: str = '<sent_end>'
+    cache_dir: str = ''
+    trust_remote_code: bool = True
 
 
 class MultiTaskContextAwareSentenceEncoder(nn.Module):
-    """
-    一个“对比学习 + MLM/MNTP近似”的多任务版本。
-
-    说明：
-    1. 对于 BERT / RoBERTa 一类双向编码器，论文中的 L_MNTP 可用标准 MLM 近似实现。
-    2. 如果你后面换成 decoder-only backbone，可以再把这里改成更贴近原论文的 token prediction 形式。
-    """
-
     def __init__(self, config: MultiTaskEncoderConfig):
         super().__init__()
         self.config = config
 
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        cache_dir = config.cache_dir or default_hf_cache_dir()
+        os.environ.setdefault("HF_HOME", cache_dir)
+        os.environ.setdefault("HF_HUB_CACHE", str(Path(cache_dir) / "hub"))
+        os.environ.setdefault("TRANSFORMERS_CACHE", str(Path(cache_dir) / "transformers"))
+
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name, cache_dir=cache_dir, trust_remote_code=config.trust_remote_code)
         self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": [config.marker_start, config.marker_end]}
+            {'additional_special_tokens': [config.marker_start, config.marker_end]}
         )
 
-        self.mlm_model = AutoModelForMaskedLM.from_pretrained(config.model_name)
-        self.mlm_model.resize_token_embeddings(len(self.tokenizer))
+        if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        self.mlm_model = AutoModelForMaskedLM.from_pretrained(config.model_name, cache_dir=cache_dir, trust_remote_code=config.trust_remote_code)
+        self.mlm_model.resize_token_embeddings(len(self.tokenizer))
         self.backbone = getattr(self.mlm_model, self.mlm_model.base_model_prefix)
 
         self.start_id = self.tokenizer.convert_tokens_to_ids(config.marker_start)
@@ -99,18 +72,18 @@ class MultiTaskContextAwareSentenceEncoder(nn.Module):
             padding=True,
             truncation=True,
             max_length=self.config.max_length,
-            return_tensors="pt",
+            return_tensors='pt',
         ).to(self.device)
         outputs = self.backbone(**batch)
-        pooled = self.mean_pool(outputs.last_hidden_state, batch["attention_mask"])
+        pooled = self.mean_pool(outputs.last_hidden_state, batch['attention_mask'])
         return F.normalize(pooled, p=2, dim=1)
 
-    def _find_marker_span(self, input_ids: torch.Tensor):
+    def _find_marker_span(self, input_ids: torch.Tensor) -> Tuple[int, int]:
         ids = input_ids.detach().cpu().tolist()
         start_pos = ids.index(self.start_id)
         end_pos = ids.index(self.end_id)
         if end_pos <= start_pos + 1:
-            raise ValueError("invalid marker span")
+            raise ValueError('invalid marker span')
         return start_pos + 1, end_pos
 
     def encode_marked_contexts(self, questions: Sequence[str], marked_contexts: Sequence[str]) -> torch.Tensor:
@@ -120,17 +93,23 @@ class MultiTaskContextAwareSentenceEncoder(nn.Module):
             padding=True,
             truncation=True,
             max_length=self.config.max_length,
-            return_tensors="pt",
+            return_tensors='pt',
         ).to(self.device)
 
         outputs = self.backbone(**batch)
         hidden = outputs.last_hidden_state
 
         sent_vecs = []
-        for b in range(hidden.size(0)):
-            start, end = self._find_marker_span(batch["input_ids"][b])
-            span_hidden = hidden[b, start:end, :]
-            sent_vecs.append(span_hidden.mean(dim=0))
+        for batch_idx in range(hidden.size(0)):
+            try:
+                start, end = self._find_marker_span(batch['input_ids'][batch_idx])
+                span_hidden = hidden[batch_idx, start:end, :]
+                sent_vec = span_hidden.mean(dim=0)
+            except ValueError:
+                # Rare long-tail samples may lose markers after truncation; fall back to whole-sequence pooling.
+                mask = batch['attention_mask'][batch_idx].unsqueeze(-1).float()
+                sent_vec = torch.sum(hidden[batch_idx] * mask, dim=0) / torch.clamp(mask.sum(), min=1e-9)
+            sent_vecs.append(sent_vec)
         sent_vecs = torch.stack(sent_vecs, dim=0)
         return F.normalize(sent_vecs, p=2, dim=1)
 
@@ -143,15 +122,15 @@ class MultiTaskContextAwareSentenceEncoder(nn.Module):
         q_emb = self.encode_question(questions)
         pos_emb = self.encode_marked_contexts(questions, positive_marked_contexts)
 
-        flat_neg_q = []
-        flat_neg_ctx = []
-        for q, negs in zip(questions, negative_marked_contexts):
+        flat_neg_questions: List[str] = []
+        flat_neg_contexts: List[str] = []
+        for question, negs in zip(questions, negative_marked_contexts):
             for neg in negs:
-                flat_neg_q.append(q)
-                flat_neg_ctx.append(neg)
+                flat_neg_questions.append(question)
+                flat_neg_contexts.append(neg)
 
-        if flat_neg_ctx:
-            neg_emb = self.encode_marked_contexts(flat_neg_q, flat_neg_ctx)
+        if flat_neg_contexts:
+            neg_emb = self.encode_marked_contexts(flat_neg_questions, flat_neg_contexts)
             candidates = torch.cat([pos_emb, neg_emb], dim=0)
         else:
             candidates = pos_emb
@@ -161,22 +140,17 @@ class MultiTaskContextAwareSentenceEncoder(nn.Module):
         return F.cross_entropy(logits, targets)
 
     def mntp_loss(self, contexts: Sequence[str]) -> torch.Tensor:
-        """
-        用 BERT 风格 MLM 近似论文中的 L_MNTP。
-        这里不对 question 做 mask，只对原始 context 做 token mask。
-        """
         batch = self.tokenizer(
             list(contexts),
             padding=True,
             truncation=True,
             max_length=self.config.max_length,
-            return_tensors="pt",
+            return_tensors='pt',
         )
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
 
         labels = input_ids.clone()
-
         probability_matrix = torch.full(labels.shape, self.config.mlm_probability)
         special_tokens_mask = torch.tensor(
             [
@@ -187,14 +161,12 @@ class MultiTaskContextAwareSentenceEncoder(nn.Module):
         )
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
         masked_indices = torch.bernoulli(probability_matrix).bool()
-
         labels[~masked_indices] = -100
 
-        # 80% [MASK], 10% random, 10% original
         indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
         mask_token_id = self.tokenizer.mask_token_id
         if mask_token_id is None:
-            raise ValueError("Tokenizer has no mask token; choose a MLM-capable backbone.")
+            raise ValueError('Tokenizer has no mask token; choose a MLM-capable backbone.')
         input_ids[indices_replaced] = mask_token_id
 
         indices_random = (
@@ -205,85 +177,56 @@ class MultiTaskContextAwareSentenceEncoder(nn.Module):
         random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
         input_ids[indices_random] = random_words[indices_random]
 
-        batch = {
-            "input_ids": input_ids.to(self.device),
-            "attention_mask": attention_mask.to(self.device),
-            "labels": labels.to(self.device),
+        model_inputs = {
+            'input_ids': input_ids.to(self.device),
+            'attention_mask': attention_mask.to(self.device),
+            'labels': labels.to(self.device),
         }
-        outputs = self.mlm_model(**batch)
+        outputs = self.mlm_model(**model_inputs)
         return outputs.loss
 
 
-class CQRMultiTaskDataset(Dataset):
-    """
-    输入 JSONL 格式：
-    {
-      "context": "...",
-      "question": "...",
-      "positive_sentence": "...",
-      "negative_sentences": ["...", "..."]
-    }
-    """
-
-    def __init__(self, path: Path, marker_start: str, marker_end: str):
-        self.rows: List[Dict] = []
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                pos_marked = build_marked_context_from_text(
-                    row["context"], row["positive_sentence"], marker_start, marker_end
-                )
-                neg_marked = [
-                    build_marked_context_from_text(row["context"], s, marker_start, marker_end)
-                    for s in row.get("negative_sentences", [])
-                ]
-                self.rows.append(
-                    {
-                        "context": row["context"],
-                        "question": row["question"],
-                        "positive_marked_context": pos_marked,
-                        "negative_marked_contexts": neg_marked,
-                    }
-                )
-
-    def __len__(self):
-        return len(self.rows)
-
-    def __getitem__(self, idx):
-        return self.rows[idx]
+def save_encoder_bundle(model: MultiTaskContextAwareSentenceEncoder, config: MultiTaskEncoderConfig, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model.mlm_model.save_pretrained(output_dir)
+    model.tokenizer.save_pretrained(output_dir)
+    with (output_dir / 'encoder_config.json').open('w', encoding='utf-8') as f:
+        json.dump(asdict(config), f, ensure_ascii=False, indent=2)
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, List[str]]:
-    return {
-        "contexts": [x["context"] for x in batch],
-        "questions": [x["question"] for x in batch],
-        "positive_marked_contexts": [x["positive_marked_context"] for x in batch],
-        "negative_marked_contexts": [x["negative_marked_contexts"] for x in batch],
-    }
+def better_metrics(current: Dict[str, float], best: Optional[Dict[str, float]]) -> bool:
+    if best is None:
+        return True
+    current_key = (float(current['mrr']), float(current['top1_acc']), float(current['avg_margin']))
+    best_key = (float(best['mrr']), float(best['top1_acc']), float(best['avg_margin']))
+    return current_key > best_key
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_file", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--model_name", type=str, default="bert-base-chinese")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.05)
-    parser.add_argument("--mlm_probability", type=float, default=0.15)
-    parser.add_argument("--lambda_mntp", type=float, default=1.0)
+    parser.add_argument('--train_file', type=str, required=True)
+    parser.add_argument('--dev_file', type=str, default='')
+    parser.add_argument('--output_dir', type=str, required=True)
+    parser.add_argument('--model_name', type=str, default='answerdotai/ModernBERT-base')
+    parser.add_argument('--cache_dir', type=str, default='')
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--lr', type=float, default=2e-5)
+    parser.add_argument('--max_length', type=int, default=512)
+    parser.add_argument('--temperature', type=float, default=0.05)
+    parser.add_argument('--mlm_probability', type=float, default=0.15)
+    parser.add_argument('--lambda_mntp', type=float, default=1.0)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--log_every', type=int, default=200)
     args = parser.parse_args()
 
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     config = MultiTaskEncoderConfig(
         model_name=args.model_name,
         max_length=args.max_length,
@@ -291,58 +234,106 @@ def main():
         mlm_probability=args.mlm_probability,
         lambda_mntp=args.lambda_mntp,
         device=device,
+        cache_dir=args.cache_dir,
     )
 
-    dataset = CQRMultiTaskDataset(
-        Path(args.train_file), config.marker_start, config.marker_end
-    )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    train_dataset = CQRDataset(Path(args.train_file), config.marker_start, config.marker_end)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    dev_dataset = CQRDataset(Path(args.dev_file), config.marker_start, config.marker_end) if args.dev_file else None
 
     model = MultiTaskContextAwareSentenceEncoder(config)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    history: List[Dict[str, float]] = []
+    best_metrics: Optional[Dict[str, float]] = None
+    best_state = None
 
     model.train()
     for epoch in range(1, args.epochs + 1):
         total_ctr = 0.0
         total_mntp = 0.0
         total = 0
+        num_batches = len(train_loader)
 
-        for batch in loader:
+        for step, batch in enumerate(train_loader, start=1):
             optimizer.zero_grad()
-
             loss_ctr = model.contrastive_loss(
-                questions=batch["questions"],
-                positive_marked_contexts=batch["positive_marked_contexts"],
-                negative_marked_contexts=batch["negative_marked_contexts"],
+                questions=batch['questions'],
+                positive_marked_contexts=batch['positive_marked_contexts'],
+                negative_marked_contexts=batch['negative_marked_contexts'],
             )
-            loss_mntp = model.mntp_loss(batch["contexts"])
+            loss_mntp = model.mntp_loss(batch['contexts'])
             loss = loss_ctr + config.lambda_mntp * loss_mntp
-
             loss.backward()
             optimizer.step()
 
-            bs = len(batch["questions"])
+            bs = len(batch['questions'])
             total_ctr += float(loss_ctr.item()) * bs
             total_mntp += float(loss_mntp.item()) * bs
             total += bs
 
-        print(
-            f"epoch={epoch:02d} "
-            f"ctr={total_ctr / max(total,1):.4f} "
-            f"mntp={total_mntp / max(total,1):.4f} "
-            f"total={(total_ctr + config.lambda_mntp * total_mntp) / max(total,1):.4f}"
-        )
+            if args.log_every > 0 and (step % args.log_every == 0 or step == num_batches):
+                avg_ctr = total_ctr / max(total, 1)
+                avg_mntp = total_mntp / max(total, 1)
+                avg_total = avg_ctr + config.lambda_mntp * avg_mntp
+                print(
+                    f"epoch={epoch:02d} step={step:05d}/{num_batches:05d} "
+                    f"ctr={avg_ctr:.4f} mntp={avg_mntp:.4f} total={avg_total:.4f}",
+                    flush=True,
+                )
+
+        train_ctr = total_ctr / max(total, 1)
+        train_mntp = total_mntp / max(total, 1)
+        train_total = train_ctr + config.lambda_mntp * train_mntp
+        record: Dict[str, float] = {
+            'epoch': float(epoch),
+            'train_ctr_loss': train_ctr,
+            'train_mntp_loss': train_mntp,
+            'train_total_loss': train_total,
+        }
+
+        if dev_dataset is not None:
+            dev_metrics = evaluate_sentence_ranking(model, dev_dataset)
+            record.update({f'dev_{key}': value for key, value in dev_metrics.items()})
+            print(
+                f"epoch={epoch:02d} ctr={train_ctr:.4f} mntp={train_mntp:.4f} total={train_total:.4f} "
+                f"dev_top1={dev_metrics['top1_acc']:.4f} dev_mrr={dev_metrics['mrr']:.4f}"
+            )
+            if better_metrics(dev_metrics, best_metrics):
+                best_metrics = dict(dev_metrics)
+                best_metrics['epoch'] = float(epoch)
+                best_metrics['train_total_loss'] = train_total
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        else:
+            print(f'epoch={epoch:02d} ctr={train_ctr:.4f} mntp={train_mntp:.4f} total={train_total:.4f}')
+
+        history.append(record)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    model.mlm_model.save_pretrained(output_dir)
-    model.tokenizer.save_pretrained(output_dir)
 
-    with (output_dir / "encoder_config.json").open("w", encoding="utf-8") as f:
-        json.dump(asdict(config), f, ensure_ascii=False, indent=2)
+    if dev_dataset is not None:
+        save_encoder_bundle(model, config, output_dir / 'last')
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        save_encoder_bundle(model, config, output_dir)
+        with (output_dir / 'best_metrics.json').open('w', encoding='utf-8') as f:
+            json.dump(best_metrics or {}, f, ensure_ascii=False, indent=2)
+    else:
+        save_encoder_bundle(model, config, output_dir)
 
-    print("saved to", output_dir)
+    with (output_dir / 'training_history.json').open('w', encoding='utf-8') as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+    print('saved best model to', output_dir)
+    if dev_dataset is not None:
+        print('saved last model to', output_dir / 'last')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+
+
+
+
+
