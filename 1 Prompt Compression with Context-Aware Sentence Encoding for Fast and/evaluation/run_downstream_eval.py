@@ -135,6 +135,22 @@ def compress_topk_lexical(question: str, context: str, ratio: float, ctx: Dict) 
     return " ".join(sentences[i] for i in sorted(chosen))
 
 
+def compress_dac_baseline(question: str, context: str, ratio: float, ctx: Dict) -> str:
+    """Official DAC (ACL 2025), re-implemented. Task-agnostic: ignores the question.
+
+    This is the published method as a baseline, NOT our question-aware salience
+    feature. Keeping them separate is what lets the results table say honestly
+    what DAC achieves versus what our adaptation of it achieves.
+    """
+    compressor = ctx.get("dac_baseline")
+    if compressor is None:
+        raise RuntimeError(
+            "method 'dac' requires the DAC baseline compressor, which was not "
+            "constructed. This is a wiring bug, not a runtime condition."
+        )
+    return compressor.compress(context=context, keep_ratio=ratio)
+
+
 def compress_ours_stage1(question: str, context: str, ratio: float, ctx: Dict) -> str:
     result = ctx["compressor_stage1"].compress(
         question=question, context=context, target_ratio=ratio
@@ -164,6 +180,7 @@ COMPRESSORS: Dict[str, Callable[[str, str, float, Dict], str]] = {
     "truncate": compress_truncate,
     "random": compress_random,
     "topk_lexical": compress_topk_lexical,
+    "dac": compress_dac_baseline,
     "ours_stage1": compress_ours_stage1,
     "ours_full": compress_ours_full,
     "ours_auto_budget": compress_ours_auto_budget,
@@ -373,6 +390,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dac_require_attention", action="store_true",
                    help="Fail instead of renormalising onto the MLM term when "
                         "question-attention is unavailable.")
+    p.add_argument("--dac_baseline_model", type=str, default="Qwen/Qwen2-0.5B-Instruct",
+                   help="Causal LM for the task-agnostic DAC baseline (method 'dac'). "
+                        "The reference implementation uses Qwen2-0.5B-Instruct.")
     p.add_argument("--dac_strict", action="store_true",
                    help="Raise if the DAC salience model cannot be loaded, instead of "
                         "printing a warning and continuing without it.")
@@ -456,6 +476,18 @@ def main() -> None:
                 "do NOT come from the trained context-aware encoder and must be "
                 "reported only as an ablation baseline. ***\n"
             )
+
+    if "dac" in methods:
+        from pipeline.dac_baseline import DacBaselineCompressor, DacBaselineConfig
+
+        ctx["dac_baseline"] = DacBaselineCompressor(
+            DacBaselineConfig(
+                model_name=args.dac_baseline_model,
+                alpha=args.dac_alpha,
+                fusion=args.dac_fusion,
+            )
+        )
+        print("dac_baseline:", json.dumps(ctx["dac_baseline"].provenance(), ensure_ascii=False))
 
     rows = load_jsonl(Path(args.input_file))
     if args.limit > 0:
