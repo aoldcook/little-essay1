@@ -25,3 +25,8 @@ external_refs/
 tmp_*.txt
 tmp_*.log
 project_source_guide.docx
+# Secrets: never commit. Use .env.example as the template.
+.env
+.env.*
+!.env.example
+**/outputs_downstream/

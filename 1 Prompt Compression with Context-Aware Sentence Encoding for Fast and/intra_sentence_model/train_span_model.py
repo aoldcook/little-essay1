@@ -16,12 +16,17 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from intra_sentence_model.span_dataset import build_xy, load_jsonl
+from intra_sentence_model.span_dataset import build_xy, build_xy_group_disjoint, load_jsonl
 from intra_sentence_model.span_feature_utils import FEATURE_ORDER
 from intra_sentence_model.span_model import SpanClassifierConfig, SpanClassifierMLP, build_metadata
 
 
-def split_train_dev(X: np.ndarray, y: np.ndarray, dev_ratio: float, seed: int = 42) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def split_train_dev_span_level(X: np.ndarray, y: np.ndarray, dev_ratio: float, seed: int = 42) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """DEPRECATED: leaks spans from one example across train and dev.
+
+    Retained only to reproduce historical (optimistic) numbers for comparison.
+    See EVAL_VALIDITY_AUDIT.md finding C4 and use --split_mode group instead.
+    """
     indices = np.arange(len(X))
     rng = np.random.default_rng(seed)
     rng.shuffle(indices)
@@ -64,6 +69,9 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--dev_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split_mode", choices=["group", "span"], default="group",
+                        help="'group' splits by source example (leakage-free, required for "
+                             "reportable numbers). 'span' reproduces the legacy leaky split.")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
@@ -72,8 +80,24 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     rows = load_jsonl(Path(args.train_file))
-    X, y = build_xy(rows)
-    X_train, y_train, X_dev, y_dev = split_train_dev(X, y, args.dev_ratio, seed=args.seed)
+    if args.split_mode == "group":
+        X_train, y_train, X_dev, y_dev, split_stats = build_xy_group_disjoint(
+            rows, args.dev_ratio, seed=args.seed
+        )
+        X = X_train
+        print("split_mode=group (leakage-free) split_stats=", json.dumps(split_stats))
+    else:
+        print(
+            "\n*** WARNING: --split_mode span shuffles individual spans, so spans from "
+            "the same source example appear in BOTH train and dev. Dev accuracy will be "
+            "optimistic (audit finding C4). Use --split_mode group for reportable "
+            "numbers. ***\n"
+        )
+        X, y = build_xy(rows)
+        X_train, y_train, X_dev, y_dev = split_train_dev_span_level(
+            X, y, args.dev_ratio, seed=args.seed
+        )
+        split_stats = {"split_mode": "span_level_LEAKY"}
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))

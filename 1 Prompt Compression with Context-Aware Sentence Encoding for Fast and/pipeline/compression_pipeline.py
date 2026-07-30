@@ -26,6 +26,12 @@ from pipeline.linguistic_information import (
     build_linguistic_sentence_features,
 )
 from pipeline.task_descriptor import build_task_descriptor, compute_task_descriptor_alignment
+from pipeline.runtime_contract import (
+    LEGACY_LEXICAL_IDS,
+    EncoderContractError,
+    RuntimeProvenance,
+    checkpoint_fingerprint,
+)
 from target_ratio_model.formula_budget import predict_formula_ratio
 
 
@@ -430,7 +436,18 @@ class ContextAwareCompressor:
         self.attention_probe_layers = attention_probe_layers
         self.budget_formula_name = budget_formula_name
 
-        if encoder_dir == "lightweight_lexical_fallback":
+        # Encoder loading contract (audit findings C1 / H3): the lexical backend is
+        # a legitimate ablation baseline but it is NOT the trained context-aware
+        # encoder, so selecting it -- explicitly or by degradation -- must always be
+        # a deliberate, recorded decision rather than a silent default.
+        if encoder_dir in LEGACY_LEXICAL_IDS:
+            if not allow_heuristic_fallback:
+                raise EncoderContractError(
+                    f"The lexical fallback backend ({encoder_dir!r}) is not the trained "
+                    "context-aware encoder and cannot be selected implicitly.\n"
+                    "Pass allow_heuristic_fallback=True to run it knowingly as a "
+                    "non-neural ablation baseline, or supply a real checkpoint path."
+                )
             self.encoder_load_error = None
             self.encoder_runtime = "lightweight_lexical_fallback"
             self.encoder = LightweightSentenceEncoder()
@@ -471,6 +488,38 @@ class ContextAwareCompressor:
                 probe_layers=attention_probe_layers,
             )
             self.span_compressor = DynamicSpanCompressor(self.encoder, span_config, span_model_dir=span_model_dir)
+
+        self.encoder_requested = str(encoder_dir)
+        self.span_model_dir = span_model_dir
+        self.budget_model_dir = budget_model_dir
+
+    def provenance(self) -> RuntimeProvenance:
+        """Record which backend actually ran, for embedding in results files.
+
+        Any results file that omits this cannot be attributed to a system, which
+        is how lexical-fallback numbers were previously mistaken for neural ones.
+        """
+        is_lexical = self.encoder_runtime == "lightweight_lexical_fallback"
+        return RuntimeProvenance(
+            encoder_kind="lexical_fallback" if is_lexical else "context_aware_encoder",
+            encoder_requested=self.encoder_requested,
+            encoder_path=None if is_lexical else self.encoder_requested,
+            encoder_runtime=self.encoder_runtime,
+            lexical_fallback_used=is_lexical,
+            fallback_reason=(
+                "load failure -> degraded" if self.encoder_load_error else
+                ("explicitly requested" if is_lexical else "")
+            ),
+            encoder_load_error=self.encoder_load_error,
+            checkpoint_fingerprint=checkpoint_fingerprint(
+                None if is_lexical else self.encoder_requested
+            ),
+            span_model_dir=self.span_model_dir,
+            span_model_active=bool(
+                getattr(getattr(self, "span_compressor", None), "learned_span_model", None)
+            ),
+            budget_model_dir=self.budget_model_dir,
+        )
 
     @staticmethod
     def _build_encoder_config(encoder_source: str, device: str, cache_dir: Optional[str]) -> Dict[str, object]:

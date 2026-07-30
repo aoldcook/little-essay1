@@ -1,7 +1,9 @@
-﻿from pathlib import Path
+﻿import os
+from pathlib import Path
 
 from context_aware_encoder_model.context_aware_sentence_encoder import default_hf_cache_dir
 from pipeline.compression_pipeline import ContextAwareCompressor, estimate_token_count
+from pipeline.runtime_contract import LEXICAL_FALLBACK_ID
 
 
 project_root = Path(__file__).resolve().parent
@@ -33,12 +35,28 @@ def _find_complete_qwen_snapshot(cache_root):
 
 
 qwen_snapshot = _find_complete_qwen_snapshot(qwen_cache)
+
+# Encoder resolution is explicit and fails loudly (audit findings C1 / H3).
+# Previously this chain silently ended at the lexical heuristic, so the demo
+# appeared to exercise the trained encoder when it never did.
+# Set ALLOW_LEXICAL_FALLBACK=1 to run the non-neural baseline on purpose.
+allow_lexical_fallback = os.environ.get("ALLOW_LEXICAL_FALLBACK", "").strip() in {"1", "true", "yes"}
 if (local_encoder / "encoder_config.json").exists():
     encoder_source = str(local_encoder)
 elif qwen_snapshot is not None:
     encoder_source = str(qwen_snapshot)
+elif allow_lexical_fallback:
+    encoder_source = LEXICAL_FALLBACK_ID
 else:
-    encoder_source = "lightweight_lexical_fallback"
+    raise SystemExit(
+        "No trained context-aware encoder checkpoint was found.\n"
+        f"  looked for : {local_encoder / 'encoder_config.json'}\n"
+        f"  and        : a complete Qwen3-Embedding-8B snapshot under {qwen_cache}\n\n"
+        "Refusing to fall back to the lexical heuristic silently: doing so would\n"
+        "print numbers that do not come from the trained encoder.\n"
+        "Either train/download a checkpoint, or run the non-neural baseline knowingly:\n"
+        "  ALLOW_LEXICAL_FALLBACK=1 python main.py"
+    )
 
 budget_model = project_root / "target_ratio_model" / "outputs_english"
 budget_model_dir = str(budget_model) if (budget_model / "metadata.json").exists() else None
@@ -66,8 +84,10 @@ compressor = ContextAwareCompressor(
     second_stage_keep_ratio=0.52,
     second_stage_min_keep_ratio=0.34,
     second_stage_max_keep_ratio=0.72,
-    allow_heuristic_fallback=True,
+    allow_heuristic_fallback=allow_lexical_fallback,
 )
+
+print("system_label:", compressor.provenance().system_label())
 
 question = "Why is the 1.5 degrees Celsius warming threshold considered a critical climate tipping point?"
 long_context = """

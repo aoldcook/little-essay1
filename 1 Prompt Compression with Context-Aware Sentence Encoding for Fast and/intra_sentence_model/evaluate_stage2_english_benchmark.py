@@ -15,6 +15,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from data_builder.build_english_cqr_dataset import TOKEN_RE, split_sentences
 from pipeline.compression_pipeline import ContextAwareCompressor, estimate_token_count
+from pipeline.runtime_contract import (
+    LEXICAL_FALLBACK_ID,
+    EncoderContractError,
+    resolve_encoder_source,
+)
+from repro.manifest import build_manifest, write_manifest
 
 
 QUESTION_STOPWORDS = {
@@ -163,9 +169,9 @@ def build_candidate_context(row: dict, max_context_sentences: int, rng: random.R
     return " ".join(selected_sentences)
 
 
-def build_compressor(span_model_dir: str | None, args: argparse.Namespace) -> ContextAwareCompressor:
+def build_compressor(span_model_dir: str | None, args: argparse.Namespace, encoder_source: str) -> ContextAwareCompressor:
     compressor = ContextAwareCompressor(
-        encoder_dir="lightweight_lexical_fallback",
+        encoder_dir=encoder_source,
         budget_formula_name=args.budget_formula_name,
         span_model_dir=span_model_dir,
         use_attention_probe=True,
@@ -182,7 +188,7 @@ def build_compressor(span_model_dir: str | None, args: argparse.Namespace) -> Co
         second_stage_keep_ratio=args.second_stage_keep_ratio,
         second_stage_min_keep_ratio=args.second_stage_min_keep_ratio,
         second_stage_max_keep_ratio=args.second_stage_max_keep_ratio,
-        allow_heuristic_fallback=True,
+        allow_heuristic_fallback=args.allow_lexical_fallback,
     )
     if compressor.span_compressor is not None and span_model_dir is not None:
         compressor.span_compressor.config.learned_keep_weight = args.learned_keep_weight
@@ -212,24 +218,30 @@ def judge_answerability(
     question_coverage = content_token_recall(question, compressed_context)
     evidence_coverage = optional_max([positive_coverage, support_coverage])
 
-    answer_ok = True if answer_coverage is None else answer_coverage >= answer_threshold
+    # FAIL-CLOSED (audit finding C2): missing coverage previously defaulted to
+    # True, so rows without an answer or question counted as "answerable" and
+    # inflated the reported rate. Absent evidence is now never a pass.
+    answer_ok = False if answer_coverage is None else answer_coverage >= answer_threshold
     evidence_ok = False if evidence_coverage is None else evidence_coverage >= evidence_threshold
-    question_ok = True if question_coverage is None else question_coverage >= question_threshold
+    question_ok = False if question_coverage is None else question_coverage >= question_threshold
     answerable = bool(answer_ok and evidence_ok and question_ok)
 
     score_parts = [
-        answer_coverage if answer_coverage is not None else 1.0,
+        answer_coverage if answer_coverage is not None else 0.0,
         evidence_coverage if evidence_coverage is not None else 0.0,
-        question_coverage if question_coverage is not None else 1.0,
+        question_coverage if question_coverage is not None else 0.0,
     ]
+    # Keys are deliberately prefixed `lexical_proxy_`: this measures whether
+    # tokens survived, NOT whether a reader can answer. Real answerability comes
+    # from evaluation/run_downstream_eval.py (EM/F1 with a frozen reader LLM).
     return {
-        "qa_answerable": answerable,
-        "qa_answerability_score": float(sum(score_parts) / len(score_parts)),
-        "qa_answer_ok": bool(answer_ok),
-        "qa_evidence_ok": bool(evidence_ok),
-        "qa_question_ok": bool(question_ok),
-        "qa_evidence_coverage": evidence_coverage,
-        "qa_question_coverage": question_coverage,
+        "lexical_proxy_answerable": answerable,
+        "lexical_proxy_score": float(sum(score_parts) / len(score_parts)),
+        "lexical_proxy_answer_ok": bool(answer_ok),
+        "lexical_proxy_evidence_ok": bool(evidence_ok),
+        "lexical_proxy_question_ok": bool(question_ok),
+        "lexical_proxy_evidence_coverage": evidence_coverage,
+        "lexical_proxy_question_coverage": question_coverage,
     }
 
 
@@ -296,19 +308,19 @@ def summarize_variant(records: Sequence[dict]) -> dict:
         "avg_positive_coverage": mean_optional([row["positive_coverage"] for row in records]),
         "avg_support_coverage": mean_optional([row["support_coverage"] for row in records]),
         "avg_answer_coverage": mean_optional([row["answer_coverage"] for row in records]),
-        "avg_qa_answerability_score": mean_optional([row["qa_answerability_score"] for row in records]),
-        "qa_answerable_rows": sum(1 for row in records if row.get("qa_answerable")),
-        "qa_answerable_rate": (
-            sum(1 for row in records if row.get("qa_answerable")) / max(len(records), 1)
+        "avg_lexical_proxy_score": mean_optional([row["lexical_proxy_score"] for row in records]),
+        "lexical_proxy_answerable_rows": sum(1 for row in records if row.get("lexical_proxy_answerable")),
+        "lexical_proxy_answerable_rate": (
+            sum(1 for row in records if row.get("lexical_proxy_answerable")) / max(len(records), 1)
         ),
-        "qa_answer_ok_rate": (
-            sum(1 for row in records if row.get("qa_answer_ok")) / max(len(records), 1)
+        "lexical_proxy_answer_ok_rate": (
+            sum(1 for row in records if row.get("lexical_proxy_answer_ok")) / max(len(records), 1)
         ),
-        "qa_evidence_ok_rate": (
-            sum(1 for row in records if row.get("qa_evidence_ok")) / max(len(records), 1)
+        "lexical_proxy_evidence_ok_rate": (
+            sum(1 for row in records if row.get("lexical_proxy_evidence_ok")) / max(len(records), 1)
         ),
-        "qa_question_ok_rate": (
-            sum(1 for row in records if row.get("qa_question_ok")) / max(len(records), 1)
+        "lexical_proxy_question_ok_rate": (
+            sum(1 for row in records if row.get("lexical_proxy_question_ok")) / max(len(records), 1)
         ),
         "avg_removed_span_count": mean_optional([row["removed_span_count"] for row in records]),
         "avg_safety_skipped_count": mean_optional([row["safety_skipped_count"] for row in records]),
@@ -337,7 +349,7 @@ def compare_pairs(rows: Sequence[dict]) -> dict:
         pos_delta = (learned["positive_coverage"] or 0.0) - (heuristic["positive_coverage"] or 0.0)
         sup_delta = (learned["support_coverage"] or 0.0) - (heuristic["support_coverage"] or 0.0)
         ans_delta = (learned["answer_coverage"] or 0.0) - (heuristic["answer_coverage"] or 0.0)
-        qa_delta = learned["qa_answerability_score"] - heuristic["qa_answerability_score"]
+        qa_delta = learned["lexical_proxy_score"] - heuristic["lexical_proxy_score"]
 
         final_ratio_delta.append(ratio_delta)
         positive_delta.append(pos_delta)
@@ -353,7 +365,7 @@ def compare_pairs(rows: Sequence[dict]) -> dict:
             learned_regressed_coverage += 1
         if learned["compressed_context"] == heuristic["compressed_context"]:
             learned_identical_context += 1
-        if learned["qa_answerable"] or not heuristic["qa_answerable"]:
+        if learned["lexical_proxy_answerable"] or not heuristic["lexical_proxy_answerable"]:
             learned_same_or_better_answerable += 1
         if ratio_delta <= 0.0 and pos_delta >= -0.01 and sup_delta >= -0.01 and ans_delta >= -0.01:
             efficient_wins += 1
@@ -364,7 +376,7 @@ def compare_pairs(rows: Sequence[dict]) -> dict:
         "avg_positive_coverage_delta": float(sum(positive_delta) / n),
         "avg_support_coverage_delta": float(sum(support_delta) / n),
         "avg_answer_coverage_delta": float(sum(answer_delta) / n),
-        "avg_qa_answerability_score_delta": float(sum(answerability_score_delta) / n),
+        "avg_lexical_proxy_score_delta": float(sum(answerability_score_delta) / n),
         "learned_lower_ratio_rows": learned_better_ratio,
         "learned_same_or_better_coverage_rows": learned_same_or_better_coverage,
         "learned_regressed_coverage_rows": learned_regressed_coverage,
@@ -382,7 +394,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--span_model_dir", type=str, default=str(PROJECT_ROOT / "intra_sentence_model" / "outputs_english_feedback"))
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--context_mode", choices=["candidate", "full"], default="candidate")
+    parser.add_argument("--encoder_dir", type=str, default=None,
+                        help="Trained context-aware encoder checkpoint. Required unless "
+                             "--allow_lexical_fallback is set.")
+    parser.add_argument("--allow_lexical_fallback", action="store_true",
+                        help="Explicitly run the NON-NEURAL lexical backend as an ablation "
+                             "baseline. Results are labelled and must not be reported as "
+                             "the main system.")
+    # Default is now `full` (audit finding C3). `candidate` guarantees gold evidence
+    # is present, which measures Stage-2 on an oracle-cleaned distribution the
+    # deployed system never sees; it is a diagnostic, not a headline setting.
+    parser.add_argument("--context_mode", choices=["candidate", "full"], default="full")
     parser.add_argument("--max_context_sentences", type=int, default=10)
     parser.add_argument("--budget_formula_name", type=str, default="entropy_spread")
     parser.add_argument("--second_stage_keep_ratio", type=float, default=0.52)
@@ -402,9 +424,35 @@ def main() -> None:
     if args.limit > 0:
         rows = rows[: args.limit]
 
+    # Encoder contract: refuse to silently degrade (audit findings C1 / H3).
+    try:
+        resolved = resolve_encoder_source(args.encoder_dir, args.allow_lexical_fallback)
+    except EncoderContractError as exc:
+        raise SystemExit(f"\nENCODER CONTRACT VIOLATION\n{exc}\n")
+    encoder_source = LEXICAL_FALLBACK_ID if resolved.is_lexical else resolved.path
+
+    print(
+        "\nNOTE: every metric produced by this script is a LEXICAL COVERAGE PROXY\n"
+        "(prefixed `lexical_proxy_`). It measures token survival, not whether a\n"
+        "reader can answer. For genuine EM/F1 run:\n"
+        "  python -m evaluation.run_downstream_eval --input_file ... --encoder_dir ...\n"
+    )
+    if args.context_mode == "candidate":
+        print(
+            "WARNING: --context_mode candidate builds contexts that GUARANTEE gold\n"
+            "evidence is present. This overestimates Stage-2. Diagnostic use only.\n"
+        )
+
     rng = random.Random(args.seed)
-    heuristic_compressor = build_compressor(span_model_dir=None, args=args)
-    learned_compressor = build_compressor(span_model_dir=args.span_model_dir, args=args)
+    heuristic_compressor = build_compressor(span_model_dir=None, args=args, encoder_source=encoder_source)
+    learned_compressor = build_compressor(span_model_dir=args.span_model_dir, args=args, encoder_source=encoder_source)
+    provenance = learned_compressor.provenance()
+    print("system_label:", provenance.system_label())
+    if provenance.lexical_fallback_used:
+        print(
+            "\n*** WARNING: NON-NEURAL lexical backend active. These numbers do NOT\n"
+            "come from the trained context-aware encoder. ***\n"
+        )
 
     detail_rows = []
     for idx, row in enumerate(rows):
@@ -431,6 +479,12 @@ def main() -> None:
     heuristic_records = [row["heuristic"] for row in detail_rows]
     learned_records = [row["learned"] for row in detail_rows]
     summary = {
+        "system_label": provenance.system_label(),
+        "metric_semantics": (
+            "All `lexical_proxy_*` fields are token-coverage PROXIES, not downstream "
+            "answer accuracy. Do not report them as answerability."
+        ),
+        "runtime_provenance": provenance.to_dict(),
         "input_file": str(Path(args.input_file)),
         "num_input_rows": len(rows),
         "num_evaluated_rows": len(detail_rows),
@@ -456,6 +510,15 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     save_jsonl(output_dir / "stage2_english_benchmark_details.jsonl", detail_rows)
     save_json(output_dir / "stage2_english_benchmark_summary.json", summary)
+    write_manifest(
+        output_dir / "manifest.json",
+        build_manifest(
+            seeds={"seed": args.seed},
+            datasets=[Path(args.input_file)],
+            config=vars(args),
+            provenance=provenance.to_dict(),
+        ),
+    )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
