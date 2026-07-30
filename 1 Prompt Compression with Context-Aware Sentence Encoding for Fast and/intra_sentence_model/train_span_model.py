@@ -17,7 +17,11 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from intra_sentence_model.span_dataset import build_xy, build_xy_group_disjoint, load_jsonl
-from intra_sentence_model.span_feature_utils import FEATURE_ORDER
+from intra_sentence_model.span_feature_utils import (
+    FEATURE_ORDER,
+    FEATURE_SCHEMA_VERSION,
+    assert_no_oracle_features,
+)
 from intra_sentence_model.span_model import SpanClassifierConfig, SpanClassifierMLP, build_metadata
 
 
@@ -78,6 +82,10 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    # Fail before training if a gold-answer-derived feature is in the input vector.
+    assert_no_oracle_features(FEATURE_ORDER)
+    print(f"feature_schema_version={FEATURE_SCHEMA_VERSION} num_features={len(FEATURE_ORDER)}")
 
     rows = load_jsonl(Path(args.train_file))
     if args.split_mode == "group":

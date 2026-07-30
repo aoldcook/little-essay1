@@ -33,19 +33,62 @@ class SpanClassifierMLP(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+class SpanModelSchemaError(RuntimeError):
+    """Raised when a checkpoint's feature schema does not match the current code."""
+
+
 def build_metadata(config: SpanClassifierConfig, feature_order: List[str], threshold: float) -> Dict:
+    from intra_sentence_model.span_feature_utils import FEATURE_SCHEMA_VERSION
+
     return {
         "input_dim": config.input_dim,
         "hidden_dims": config.hidden_dims,
         "dropout": config.dropout,
         "feature_order": feature_order,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "threshold": threshold,
     }
 
 
 def load_span_model(model_dir: str | Path, device: str | torch.device) -> Tuple[SpanClassifierMLP, Dict]:
+    """Load a span classifier, refusing any checkpoint whose features misalign.
+
+    Without this check a checkpoint trained under an older FEATURE_ORDER loads
+    happily and reads every feature at the wrong index -- producing confident,
+    meaningless scores. Schema v1 checkpoints in particular were trained with the
+    oracle features (finding C5) and are not usable.
+    """
+    from intra_sentence_model.span_feature_utils import (
+        FEATURE_ORDER,
+        FEATURE_SCHEMA_VERSION,
+        assert_no_oracle_features,
+    )
+
     model_dir = Path(model_dir)
     metadata = json.loads((model_dir / "metadata.json").read_text(encoding="utf-8"))
+
+    ckpt_order = list(metadata.get("feature_order") or [])
+    ckpt_version = metadata.get("feature_schema_version")
+    if ckpt_order and ckpt_order != list(FEATURE_ORDER):
+        missing = [f for f in FEATURE_ORDER if f not in ckpt_order]
+        extra = [f for f in ckpt_order if f not in FEATURE_ORDER]
+        raise SpanModelSchemaError(
+            f"Span model at {model_dir} was trained with a different feature schema "
+            f"(checkpoint v{ckpt_version}, code v{FEATURE_SCHEMA_VERSION}).\n"
+            f"  in code but not checkpoint : {missing}\n"
+            f"  in checkpoint but not code : {extra}\n\n"
+            "Loading it would silently read features at the wrong indices. Retrain:\n"
+            "  python -m intra_sentence_model.train_span_model --split_mode group ..."
+        )
+    assert_no_oracle_features(ckpt_order or FEATURE_ORDER)
+
+    expected_dim = len(FEATURE_ORDER)
+    if int(metadata["input_dim"]) != expected_dim:
+        raise SpanModelSchemaError(
+            f"Span model input_dim={metadata['input_dim']} but the current feature "
+            f"vector has {expected_dim} dimensions. Retrain the span model."
+        )
+
     config = SpanClassifierConfig(
         input_dim=int(metadata["input_dim"]),
         hidden_dims=list(metadata["hidden_dims"]),

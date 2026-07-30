@@ -89,13 +89,37 @@ and the `RuntimeProvenance`. Secrets are recorded only as
 **Verified:** EM/F1/ROUGE-L/multi-ref/evidence-recall all produce correct values
 on hand-checked cases.
 
-## 5. Not yet done — next tier, in order
+## 4b. Oracle-feature removal (C5) — implemented
 
-- `[ ]` **C5 — remove oracle features.** Delete `answer_overlap` and `answer_drop`
-  from `FEATURE_ORDER` (`span_feature_utils.py:112-114`); they are informative in
-  training but hardcoded to `0.0` at inference
-  (`task_aware_compression.py:380-381`). Retrain and re-report. Keep answer-derived
-  quantities as *label* supervision only, explicitly.
+`[x]` `answer_overlap` and `answer_drop` removed from `FEATURE_ORDER`
+(31 → **29** features). They are still computed and stored in the feature dict for
+label construction and analysis, but `features_to_vector()` projects only onto
+`FEATURE_ORDER`, so they can no longer reach the model.
+
+`[x]` `ORACLE_ONLY_FEATURES` + `assert_no_oracle_features()` guard, called at the
+top of span training, so reintroduction fails immediately.
+
+`[x]` `FEATURE_SCHEMA_VERSION = 2`, written into checkpoint metadata.
+`load_span_model()` now **rejects** any checkpoint whose `feature_order` or
+`input_dim` disagrees with the current code, listing the exact differing features.
+Previously a v1 (oracle-trained, 31-dim) checkpoint would load and read every
+feature at the wrong index, producing confident but meaningless scores.
+
+`[x]` `DynamicSpanCompressor._load_trained_span_model()` no longer swallows
+exceptions. An explicitly requested span model that fails to load used to silently
+revert to the rule-based pruner, so a "learned" run could be entirely heuristic —
+the same defect class as C1/H3. It now raises.
+
+**Verified:** oracle values 0.99/0.88 provably absent from the 29-dim vector while
+still present in the dict; guard fires on reintroduction; a simulated v1
+checkpoint is rejected naming `['answer_overlap','answer_drop']`; `input_dim`
+mismatch rejected.
+
+**Consequence:** all existing span checkpoints are invalid and must be retrained
+with `--split_mode group`. This is intended — they were trained on leaked splits
+with oracle features.
+
+## 5. Not yet done — next tier, in order
 - `[ ]` **H1 — replace lexical pseudo-labels** with reader log-likelihood deltas
   (see `BRIEF_PRO_NOTES.md`, "Helpfulness"). Removes the circularity between
   labels and the metric.

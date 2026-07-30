@@ -333,13 +333,30 @@ class DynamicSpanCompressor:
             self._load_trained_span_model(span_model_dir)
 
     def _load_trained_span_model(self, span_model_dir: str) -> None:
+        """Load the learned span scorer, failing loudly on a bad checkpoint.
+
+        This previously swallowed every exception and silently reverted to the
+        rule-based heuristic, so a missing, corrupt, or schema-mismatched span
+        model looked exactly like a working "learned" run. That is the same class
+        of defect as the encoder fallback (EVAL_VALIDITY_AUDIT.md C1/H3): an
+        explicitly requested component must never vanish quietly.
+        """
         try:
             model, metadata = load_span_model(span_model_dir, self.device)
-        except Exception:
+        except Exception as exc:
             self.learned_span_model = None
             self.learned_span_metadata = None
             self.learned_span_threshold = 0.5
-            return
+            self.learned_span_load_error = f"{type(exc).__name__}: {exc}"
+            raise RuntimeError(
+                f"A learned span model was requested from {span_model_dir!r} but could "
+                f"not be loaded: {self.learned_span_load_error}\n\n"
+                "Refusing to fall back to the heuristic span pruner silently -- the run "
+                "would be reported as 'learned' while being rule-based. Fix the "
+                "checkpoint, or construct DynamicSpanCompressor without span_model_dir "
+                "to use the heuristic deliberately."
+            ) from exc
+        self.learned_span_load_error = None
         self.learned_span_model = model
         self.learned_span_metadata = metadata
         self.learned_span_threshold = float(metadata.get("threshold", 0.5))
@@ -377,8 +394,9 @@ class DynamicSpanCompressor:
                 question_type=question_type,
                 attention_score=attention_scores[idx] if idx < len(attention_scores) else 0.0,
                 dac_score=dac_scores[idx] if idx < len(dac_scores) else 0.0,
-                answer_overlap=0.0,
-                answer_drop=0.0,
+                # answer_overlap / answer_drop are gold-answer derived and thus
+                # unavailable here. They are no longer part of FEATURE_ORDER, so
+                # these defaults never reach the model (finding C5).
                 protected=span.protected,
             )
             feature_rows.append(features_to_vector(feature_dict))

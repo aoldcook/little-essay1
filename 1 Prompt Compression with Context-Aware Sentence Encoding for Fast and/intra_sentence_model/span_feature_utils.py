@@ -90,6 +90,21 @@ QUESTION_TYPES = [
     "factoid",
     "other",
 ]
+# Bumped whenever FEATURE_ORDER changes, so a stale checkpoint cannot be loaded
+# against a mismatched feature vector. v2 removed the oracle features.
+FEATURE_SCHEMA_VERSION = 2
+
+# Features that are derived from the GOLD ANSWER. They are available while
+# generating pseudo-labels but are structurally unavailable at inference time,
+# where task_aware_compression.py could only ever pass 0.0. Training on them and
+# then zeroing them was a train/test distribution mismatch that made the learned
+# weights meaningless at deployment (EVAL_VALIDITY_AUDIT.md finding C5).
+#
+# They are therefore EXCLUDED from the model input. They remain computed and
+# recorded in the feature dict for label construction and for analysis, but they
+# must never re-enter FEATURE_ORDER.
+ORACLE_ONLY_FEATURES = ("answer_overlap", "answer_drop")
+
 FEATURE_ORDER = [
     "sentence_score",
     "keep_ratio",
@@ -110,8 +125,7 @@ FEATURE_ORDER = [
     "query_overlap",
     "anchor_score",
     "task_reward",
-    "answer_overlap",
-    "answer_drop",
+    # answer_overlap / answer_drop deliberately absent -- see ORACLE_ONLY_FEATURES.
     "attention_score",
     "dac_score",
     "protected_flag",
@@ -330,4 +344,21 @@ def build_span_feature_dict(
 
 
 def features_to_vector(features: Dict[str, float]) -> List[float]:
+    """Project a feature dict onto the model input vector.
+
+    Only FEATURE_ORDER entries are included, so oracle-only features present in
+    the dict never reach the model.
+    """
     return [float(features[name]) for name in FEATURE_ORDER]
+
+
+def assert_no_oracle_features(feature_order: Sequence[str]) -> None:
+    """Guard against an oracle feature being reintroduced into the model input."""
+    leaked = [name for name in ORACLE_ONLY_FEATURES if name in feature_order]
+    if leaked:
+        raise ValueError(
+            f"Oracle-derived features {leaked} are in the model input vector. These are "
+            "computed from the gold answer and are unavailable at inference time "
+            "(they would be zeroed), so training on them is invalid. See "
+            "EVAL_VALIDITY_AUDIT.md finding C5."
+        )
