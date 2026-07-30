@@ -1078,8 +1078,12 @@ class DynamicSpanCompressor:
                 "or construct the compressor with enable_dac=False."
             )
 
+        # split_sentence_into_spans emits stripped .text but offsets that may
+        # include the adjoining whitespace, so compare on stripped content. The
+        # point is to catch offsets pointing at the WRONG WORDS, not to police
+        # whitespace edges -- a leading space costs at most one token either way.
         for span in spans:
-            if sentence[span.start:span.end] != span.text:
+            if sentence[span.start:span.end].strip() != span.text.strip():
                 self.dac_offset_mismatch = True
                 raise ValueError(
                     "span offsets do not describe the supplied sentence "
