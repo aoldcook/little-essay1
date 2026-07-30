@@ -224,6 +224,7 @@ def build_compressors(args: argparse.Namespace, resolved) -> Dict[str, object]:
         # enforced the policy above; the contract decision is made once, there.
         allow_heuristic_fallback=resolved.is_lexical,
         enable_dac=not args.disable_dac,
+        dac_salience_backend=args.dac_salience_backend,
         dac_salience_model=args.dac_salience_model,
         dac_fusion=args.dac_fusion,
         dac_alpha=args.dac_alpha,
@@ -355,10 +356,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--disable_dac", action="store_true",
                    help="Turn the DAC salience signal off deliberately (ablation arm). "
                         "Recorded as 'deliberately_disabled', distinct from a load failure.")
+    p.add_argument("--dac_salience_backend", type=str, default="causal",
+                   choices=["causal", "mlm"],
+                   help="'causal' = single-pass shifted cross-entropy, faithful to DAC "
+                        "(ACL 2025) and O(1) forwards. 'mlm' = per-token masking, "
+                        "O(n) forwards, retained as an ablation arm only.")
     p.add_argument("--dac_salience_model", type=str, default=None,
-                   help="Masked-LM providing token information content, e.g. roberta-base. "
-                        "MUST publish trained MLM head weights; a bare AutoModel "
-                        "checkpoint is rejected because its head would be random.")
+                   help="LM providing token information content. Defaults to "
+                        "Qwen/Qwen2-0.5B-Instruct for the causal backend and "
+                        "roberta-base for mlm. A bare AutoModel checkpoint is "
+                        "rejected when its head would be randomly initialised.")
     p.add_argument("--dac_fusion", type=str, default="additive",
                    choices=["additive", "multiplicative"])
     p.add_argument("--dac_alpha", type=float, default=0.8,

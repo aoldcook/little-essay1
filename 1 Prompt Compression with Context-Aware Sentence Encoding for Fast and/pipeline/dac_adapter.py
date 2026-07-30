@@ -34,13 +34,21 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForMaskedLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForMaskedLM, AutoTokenizer
 
 
-# An encoder-MLM whose masked-LM head weights are actually published. Do not
-# swap this for a checkpoint saved via bare `AutoModel` -- the head would be
-# randomly re-initialised and the salience signal would be noise (guarded below).
-DEFAULT_SALIENCE_MODEL = "roberta-base"
+# Official DAC (ACL 2025, arXiv 2507.11942) derives token information content
+# from a small CAUSAL LM in a SINGLE forward pass: shift the logits, take
+# per-token cross-entropy. That is O(1) forwards for the whole sequence.
+#
+# The "mlm" backend below masks each position in turn instead, which needs O(n)
+# forwards and measures bidirectional cloze difficulty rather than left-to-right
+# surprisal. It is retained only as an ablation arm; "causal" is the default
+# because it is both faithful to the cited method and orders of magnitude
+# cheaper.
+DEFAULT_SALIENCE_MODEL_CAUSAL = "Qwen/Qwen2-0.5B-Instruct"
+DEFAULT_SALIENCE_MODEL_MLM = "roberta-base"
+SALIENCE_BACKENDS = ("causal", "mlm")
 
 # Parameter-name fragments belonging to a masked-LM prediction head. If any of
 # these are reported missing when loading, the head was randomly initialised.
@@ -66,10 +74,22 @@ class DacCompressionConfig:
     min_tokens: int = 6
     preserve_punct: bool = True
     avoid_consecutive: bool = True
-    # Masked-LM used for token information content. MUST have a trained MLM head.
-    salience_model_name: str = DEFAULT_SALIENCE_MODEL
+    # "causal" = single-pass shifted cross-entropy (faithful to DAC, O(1)
+    # forwards). "mlm" = per-token masking (O(n) forwards), ablation only.
+    salience_backend: str = "causal"
+    # Empty means "pick the default for the chosen backend".
+    salience_model_name: str = ""
     # Raise instead of renormalising when the question-attention term is missing.
     require_attention: bool = False
+
+    def resolved_salience_model(self) -> str:
+        if self.salience_model_name:
+            return self.salience_model_name
+        return (
+            DEFAULT_SALIENCE_MODEL_CAUSAL
+            if self.salience_backend == "causal"
+            else DEFAULT_SALIENCE_MODEL_MLM
+        )
 
 
 class DacTokenAdapter:
@@ -100,8 +120,13 @@ class DacTokenAdapter:
         self.encoder_max_length = sentence_encoder.config.max_length
         self.special_token_ids = set(getattr(self.encoder_tokenizer, "all_special_ids", []))
 
-        # Salience side: an independent masked-LM.
-        self.salience_model_name = dac_model_name or self.config.salience_model_name
+        # Salience side: an independent LM, causal by default.
+        self.backend = self.config.salience_backend
+        if self.backend not in SALIENCE_BACKENDS:
+            raise ValueError(
+                f"unknown salience_backend {self.backend!r}; expected one of {SALIENCE_BACKENDS}"
+            )
+        self.salience_model_name = dac_model_name or self.config.resolved_salience_model()
         self.salience_tokenizer = None
         self.entropy_model = None
         self.max_length = self.encoder_max_length
@@ -133,11 +158,11 @@ class DacTokenAdapter:
             self._report(strict, verbose)
             return
 
-        if self.salience_tokenizer.mask_token_id is None:
+        if self.backend == "mlm" and self.salience_tokenizer.mask_token_id is None:
             self.unavailable_reason = (
                 f"salience tokenizer {self.salience_model_name!r} has no mask token, so "
                 "per-token masked-LM scoring is impossible. Use an encoder-MLM "
-                "(e.g. roberta-base, bert-base-uncased), not a causal/embedding model."
+                "(e.g. roberta-base, bert-base-uncased), or switch to the causal backend."
             )
             self._report(strict, verbose)
             return
@@ -154,42 +179,53 @@ class DacTokenAdapter:
             cache_dir=getattr(self.sentence_encoder.config, "cache_dir", "") or None,
             output_loading_info=True,
         )
+        loader = (
+            AutoModelForCausalLM if self.backend == "causal" else AutoModelForMaskedLM
+        )
         loading_info = None
         try:
             try:
-                self.entropy_model, loading_info = AutoModelForMaskedLM.from_pretrained(
+                self.entropy_model, loading_info = loader.from_pretrained(
                     self.salience_model_name, attn_implementation="eager", **kwargs
                 )
             except TypeError:
-                self.entropy_model, loading_info = AutoModelForMaskedLM.from_pretrained(
+                self.entropy_model, loading_info = loader.from_pretrained(
                     self.salience_model_name, **kwargs
                 )
         except Exception as exc:
             self.entropy_model = None
             self.unavailable_reason = (
-                f"could not load a masked-LM from {self.salience_model_name!r}: "
+                f"could not load a {self.backend} LM from {self.salience_model_name!r}: "
                 f"{type(exc).__name__}: {exc}"
             )
             self._report(strict, verbose)
             return
 
         # The load succeeded, but did the LM head actually come from the checkpoint?
-        missing = _lm_head_keys_missing((loading_info or {}).get("missing_keys", []))
-        if missing:
-            self.entropy_model = None
-            self.unavailable_reason = (
-                f"masked-LM head was randomly initialised when loading "
-                f"{self.salience_model_name!r} (missing: {missing[:4]}). DAC salience "
-                f"would be noise, so it is disabled. Point --dac_salience_model at a "
-                f"checkpoint that publishes trained MLM head weights."
-            )
-            self._report(strict, verbose)
-            return
+        # Only meaningful when the head is a separate parameter set. Causal models
+        # frequently TIE lm_head to the input embeddings, in which case the head
+        # keys are legitimately absent from the checkpoint and flagging them would
+        # disable a perfectly good model.
+        tied = bool(getattr(getattr(self.entropy_model, "config", None), "tie_word_embeddings", False))
+        if not tied:
+            missing = _lm_head_keys_missing((loading_info or {}).get("missing_keys", []))
+            if missing:
+                self.entropy_model = None
+                self.unavailable_reason = (
+                    f"LM head was randomly initialised when loading "
+                    f"{self.salience_model_name!r} (missing: {missing[:4]}). DAC salience "
+                    f"would be noise, so it is disabled. Point --dac_salience_model at a "
+                    f"checkpoint that publishes trained head weights."
+                )
+                self._report(strict, verbose)
+                return
 
-        # roberta-base et al. cap out at 512 positions; never exceed the model.
-        model_cap = int(getattr(self.salience_tokenizer, "model_max_length", 512) or 512)
+        # roberta-base caps at 512 positions; causal models advertise far more but
+        # we never need the whole window for a single sentence.
+        default_cap = 2048 if self.backend == "causal" else 512
+        model_cap = int(getattr(self.salience_tokenizer, "model_max_length", default_cap) or default_cap)
         if model_cap > 100_000:  # sentinel used by some tokenizers
-            model_cap = 512
+            model_cap = default_cap
         self.max_length = max(8, min(self.encoder_max_length, model_cap))
 
         self.entropy_model = self.entropy_model.to(self.device)
@@ -207,6 +243,7 @@ class DacTokenAdapter:
         """What actually ran. Belongs in the run manifest."""
         return {
             "dac_available": bool(self.available),
+            "dac_salience_backend": self.backend,
             "dac_salience_model": self.salience_model_name,
             "dac_unavailable_reason": self.unavailable_reason,
             "dac_fusion": self.config.fusion,
@@ -241,7 +278,61 @@ class DacTokenAdapter:
     def compute_token_losses(
         self, text: str
     ) -> Tuple[Optional[torch.Tensor], Optional[List[List[int]]]]:
-        """Masked-LM cross-entropy per token, with character offsets into `text`."""
+        """Per-token information content, with character offsets into `text`."""
+        if self.backend == "causal":
+            return self._causal_token_losses(text)
+        return self._mlm_token_losses(text)
+
+    def _causal_token_losses(
+        self, text: str
+    ) -> Tuple[Optional[torch.Tensor], Optional[List[List[int]]]]:
+        """Shifted cross-entropy from ONE forward pass (official DAC's get_ppl).
+
+        logits[t] predicts token t+1, so the raw loss vector has length n-1 and
+        describes tokens 1..n-1. Token 0 is unconditioned and has no loss; it is
+        assigned the mean of the rest so the returned tensor stays 1:1 with
+        `offsets` and callers need no special case.
+        """
+        if not self.available or not text.strip():
+            return None, None
+
+        encoding = self.salience_tokenizer(
+            text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+        )
+        seq_len = encoding["input_ids"].size(1)
+        if seq_len == 0:
+            return None, None
+        offsets = encoding["offset_mapping"][0].tolist()
+        if seq_len < self.config.min_tokens or seq_len < 2:
+            return None, offsets
+
+        input_ids = encoding["input_ids"].to(self.device)
+        attention_mask = encoding["attention_mask"].to(self.device)
+
+        with torch.no_grad():
+            outputs = self.entropy_model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = input_ids[..., 1:].contiguous()
+            losses = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction="none",
+            )
+
+        mean_loss = losses.mean() if losses.numel() else torch.zeros(1, device=self.device)
+        aligned = torch.cat([mean_loss.reshape(1), losses], dim=0)
+        return aligned, offsets
+
+    def _mlm_token_losses(
+        self, text: str
+    ) -> Tuple[Optional[torch.Tensor], Optional[List[List[int]]]]:
+        """Masked-LM cross-entropy per token: O(n) forward passes. Ablation only."""
         if not self.available or not text.strip():
             return None, None
 

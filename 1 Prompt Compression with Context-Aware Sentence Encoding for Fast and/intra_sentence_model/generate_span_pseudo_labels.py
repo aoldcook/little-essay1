@@ -25,6 +25,7 @@ from intra_sentence_model.span_feature_utils import (
     query_overlap_score,
     tokenize_mixed,
 )
+from pipeline.dac_adapter import DacCompressionConfig
 from pipeline.task_aware_compression import DynamicSpanCompressor, IntraSentenceCompressionConfig
 
 
@@ -339,6 +340,11 @@ def main() -> None:
     parser.add_argument("--label_policy", choices=["heuristic", "feedback"], default="heuristic")
     parser.add_argument("--log_every", type=int, default=500)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--disable_dac", action="store_true",
+                        help="Generate features with the DAC salience signal off (ablation arm).")
+    parser.add_argument("--dac_salience_backend", type=str, default="causal",
+                        choices=["causal", "mlm"])
+    parser.add_argument("--dac_salience_model", type=str, default=None)
     args = parser.parse_args()
 
     rows = load_jsonl(Path(args.input_file))
@@ -349,6 +355,11 @@ def main() -> None:
             target_keep_ratio=args.default_keep_ratio,
             min_sentence_chars=args.min_sentence_chars,
         ),
+        dac_config=DacCompressionConfig(
+            salience_backend=args.dac_salience_backend,
+            salience_model_name=args.dac_salience_model or "",
+        ),
+        enable_dac=not args.disable_dac,
     )
 
     output_path = Path(args.output_file)
@@ -516,6 +527,9 @@ def main() -> None:
                     "dac_active": bool(getattr(compressor.dac_adapter, "available", False)),
                     "dac_salience_model": getattr(
                         compressor.dac_adapter, "salience_model_name", None
+                    ),
+                    "dac_salience_backend": getattr(
+                        compressor.dac_adapter, "backend", None
                     ),
                 }
                 out_f.write(json.dumps(output_row, ensure_ascii=False) + "\n")

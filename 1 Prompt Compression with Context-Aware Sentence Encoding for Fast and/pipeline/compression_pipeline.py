@@ -414,6 +414,7 @@ class ContextAwareCompressor:
         span_model_dir: Optional[str] = None,
         allow_heuristic_fallback: bool = False,
         enable_dac: bool = True,
+        dac_salience_backend: str = "causal",
         dac_salience_model: Optional[str] = None,
         dac_fusion: str = "additive",
         dac_alpha: float = 0.8,
@@ -498,6 +499,7 @@ class ContextAwareCompressor:
                 fusion=dac_fusion,
                 alpha=dac_alpha,
                 require_attention=dac_require_attention,
+                salience_backend=dac_salience_backend,
             )
             if dac_salience_model:
                 dac_config.salience_model_name = dac_salience_model
