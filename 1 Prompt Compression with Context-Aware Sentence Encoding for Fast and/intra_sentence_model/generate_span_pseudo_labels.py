@@ -151,6 +151,33 @@ def extractive_demo_answer(question: str, context: str) -> str:
     return " ".join(top)
 
 
+def reader_answer_quality(prediction: str, gold_answer: str) -> float:
+    """Answer F1 of a real reader's output against the gold answer."""
+    if not gold_answer.strip() or not prediction.strip():
+        return 0.0
+    from evaluation.qa_metrics import score_prediction
+
+    return float(score_prediction(prediction, [gold_answer]).get("f1", 0.0))
+
+
+def build_reader_pseudo_label(answer_drop: float, threshold: float) -> tuple[int, float]:
+    """Label a span by what removing it actually does to a downstream reader.
+
+    This is the point of the reader-grounded policy. The heuristic and feedback
+    policies both compute the label as a weighted sum over the SAME features the
+    span model receives as input, so the model can only ever rediscover that
+    formula -- measured at 0.990 group-disjoint dev accuracy, versus 0.576 for a
+    majority-class baseline and 0.904 for plain logistic regression. A model that
+    reproduces a rule it was handed cannot be reported as learned.
+
+    Here the target is a measured quantity the model cannot see: the drop in the
+    reader's answer F1 when this span is deleted. Predicting it from cheap
+    features is a real learning problem with a real generalisation gap.
+    """
+    label = 1 if answer_drop >= threshold else 0
+    return label, float(answer_drop)
+
+
 def compute_answer_quality(question: str, context: str, answer: str) -> float:
     if not answer.strip():
         return 0.0
@@ -337,7 +364,24 @@ def main() -> None:
     parser.add_argument("--min_sentence_chars", type=int, default=45)
     parser.add_argument("--include_negative_sentences", action="store_true")
     parser.add_argument("--max_negative_training_sentences", type=int, default=2)
-    parser.add_argument("--label_policy", choices=["heuristic", "feedback"], default="heuristic")
+    parser.add_argument("--label_policy", choices=["heuristic", "feedback", "reader"], default="heuristic",
+                        help="'reader' labels each span by the measured drop in a real "
+                             "reader's answer F1 when the span is removed -- a target the "
+                             "span model cannot see. 'heuristic' and 'feedback' both derive "
+                             "the label from the model's own input features and are "
+                             "therefore only distillations of a hand-written rule.")
+    parser.add_argument("--answer_mode", choices=["lexical", "reader"], default="lexical",
+                        help="'lexical' uses the extractive_demo_answer stub. 'reader' calls "
+                             "a real LLM. Required by --label_policy reader.")
+    parser.add_argument("--label_reader_model", type=str, default="qwen-flash",
+                        help="Reader used to GENERATE labels. Deliberately defaults to a "
+                             "different model from the evaluation reader: labelling and "
+                             "scoring with the same LLM would tune Stage 2 to its own judge.")
+    parser.add_argument("--reader_concurrency", type=int, default=8)
+    parser.add_argument("--reader_cache", type=str, default="",
+                        help="JSONL cache of reader answers. Defaults to <output_file>.readercache.jsonl")
+    parser.add_argument("--reader_drop_threshold", type=float, default=0.10,
+                        help="Answer-F1 drop at or above which a span is labelled keep=1.")
     parser.add_argument("--log_every", type=int, default=500)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--disable_dac", action="store_true",
@@ -346,6 +390,30 @@ def main() -> None:
                         choices=["causal", "mlm"])
     parser.add_argument("--dac_salience_model", type=str, default=None)
     args = parser.parse_args()
+
+    if args.label_policy == "reader" and args.answer_mode != "reader":
+        raise SystemExit(
+            "--label_policy reader requires --answer_mode reader: the label IS the "
+            "measured reader drop, so there is nothing to derive it from otherwise."
+        )
+
+    batch_reader = None
+    if args.answer_mode == "reader":
+        from evaluation.cached_reader import CachedBatchReader
+        from evaluation.reader_client import QwenReader, ReaderConfig
+
+        reader = QwenReader(ReaderConfig.from_env(model=args.label_reader_model))
+        smoke = reader.smoke_test()
+        print("label_reader_smoke_test:", json.dumps(smoke, ensure_ascii=False))
+        if not smoke["reachable"]:
+            raise SystemExit(
+                f"Label reader unreachable (model={smoke['model']}): {smoke['error']}"
+            )
+        cache_path = args.reader_cache or (str(args.output_file) + ".readercache.jsonl")
+        batch_reader = CachedBatchReader(
+            reader, cache_path=cache_path, concurrency=args.reader_concurrency
+        )
+        print("label_reader:", json.dumps(batch_reader.provenance(), ensure_ascii=False))
 
     rows = load_jsonl(Path(args.input_file))
     encoder = load_encoder_from_dir(args.encoder_dir, args.device)
@@ -426,6 +494,27 @@ def main() -> None:
                 if not dac_scores:
                     dac_scores = [0.0 for _ in spans]
 
+                # Reader-grounded labels: ask a real LLM to answer with the full
+                # context and with each span removed, and use the drop in answer
+                # F1 as supervision. Batched here because the calls for one
+                # sentence are independent; see evaluation/cached_reader.py.
+                reader_removal_quality: List[float] = []
+                reader_base_quality = None
+                if batch_reader is not None:
+                    pruned_contexts = []
+                    for span in spans:
+                        pruned = compressor.cleanup_sentence(
+                            sentence[: span.start] + sentence[span.end :], sentence
+                        )
+                        pruned_contexts.append(context.replace(sentence, pruned, 1))
+                    answers = batch_reader.answer_many(
+                        [(question, context)] + [(question, c) for c in pruned_contexts]
+                    )
+                    reader_base_quality = reader_answer_quality(answers[0], answer)
+                    reader_removal_quality = [
+                        reader_answer_quality(a, answer) for a in answers[1:]
+                    ]
+
                 span_rows = []
                 sentence_score = float(row.get("sentence_score", training_sentence.sentence_score))
                 keep_ratio = float(row.get("keep_ratio", args.default_keep_ratio))
@@ -436,8 +525,12 @@ def main() -> None:
                 for span_index, span in enumerate(spans):
                     pruned_sentence = compressor.cleanup_sentence(sentence[: span.start] + sentence[span.end :], sentence)
                     modified_context = context.replace(sentence, pruned_sentence, 1)
-                    removal_quality = compute_answer_quality(question, modified_context, answer)
-                    answer_drop = max(0.0, base_answer_quality - removal_quality)
+                    if batch_reader is not None:
+                        removal_quality = reader_removal_quality[span_index]
+                        answer_drop = max(0.0, (reader_base_quality or 0.0) - removal_quality)
+                    else:
+                        removal_quality = compute_answer_quality(question, modified_context, answer)
+                        answer_drop = max(0.0, base_answer_quality - removal_quality)
                     answer_recall_drop = max(0.0, token_recall(answer, context) - token_recall(answer, modified_context)) if answer else 0.0
                     support_drop = max(0.0, base_support_recall - average_token_recall(support_refs, modified_context))
                     sentence_drop = max(0.0, base_sentence_recall - token_recall(sentence, modified_context))
@@ -462,7 +555,21 @@ def main() -> None:
                         protected=span.protected,
                     )
                     heuristic_label, heuristic_score = build_heuristic_pseudo_label(span, feature_dict, answer_drop)
-                    if args.label_policy == "feedback":
+                    if args.label_policy == "reader":
+                        label, pseudo_keep_score = build_reader_pseudo_label(
+                            answer_drop, args.reader_drop_threshold
+                        )
+                        feedback = {
+                            "qa_feedback_drop": float(answer_drop),
+                            "answer_drop": float(answer_drop),
+                            "reader_base_quality": float(reader_base_quality or 0.0),
+                            "reader_removal_quality": float(removal_quality),
+                            "support_drop": float(support_drop),
+                            "sentence_drop": float(sentence_drop),
+                            "hard_keep": False,
+                            "weak_redundant": False,
+                        }
+                    elif args.label_policy == "feedback":
                         label, pseudo_keep_score, feedback = build_feedback_pseudo_label(
                             question=question,
                             question_type=question_type,
@@ -501,6 +608,19 @@ def main() -> None:
                             "hard_keep": feedback["hard_keep"],
                             "weak_redundant": feedback["weak_redundant"],
                             "pseudo_keep_score": pseudo_keep_score,
+                            # Reader diagnostics. reader_base_quality is what the
+                            # reader scored on the FULL context: when it is 0 the
+                            # reader could not answer even before compression, so
+                            # answer_drop is 0 by construction and this span
+                            # carries no supervision. Such rows must be counted,
+                            # and excluded from any claim about learned behaviour.
+                            "reader_base_quality": (
+                                float(reader_base_quality) if reader_base_quality is not None else None
+                            ),
+                            "reader_removal_quality": (
+                                float(reader_removal_quality[span_index])
+                                if reader_removal_quality else None
+                            ),
                             "label": label,
                             "features": feature_dict,
                         }
@@ -530,6 +650,16 @@ def main() -> None:
                     ),
                     "dac_salience_backend": getattr(
                         compressor.dac_adapter, "backend", None
+                    ),
+                    # Which supervision produced `label`. A span model trained on
+                    # rule-derived labels and one trained on measured reader drops
+                    # are different objects and must not be confused downstream.
+                    "answer_mode": args.answer_mode,
+                    "label_reader_model": (
+                        args.label_reader_model if args.answer_mode == "reader" else None
+                    ),
+                    "reader_drop_threshold": (
+                        args.reader_drop_threshold if args.label_policy == "reader" else None
                     ),
                 }
                 out_f.write(json.dumps(output_row, ensure_ascii=False) + "\n")
