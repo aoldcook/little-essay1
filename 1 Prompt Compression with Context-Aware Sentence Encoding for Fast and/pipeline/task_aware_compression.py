@@ -855,16 +855,30 @@ class DynamicSpanCompressor:
                 depth -= 1
 
             if depth == 0 and ch in BOUNDARY_CHARS:
-                text = "".join(current).strip()
+                raw = "".join(current)
+                text = raw.strip()
                 if text:
-                    spans.append(self.build_span(question, text, start, idx + 1, question_type))
+                    lead = len(raw) - len(raw.lstrip())
+                    span_start = start + lead
+                    spans.append(
+                        self.build_span(
+                            question, text, span_start, span_start + len(text), question_type
+                        )
+                    )
                 current = []
                 start = idx + 1
 
         if current:
-            text = "".join(current).strip()
+            raw = "".join(current)
+            text = raw.strip()
             if text:
-                spans.append(self.build_span(question, text, start, len(sentence), question_type))
+                lead = len(raw) - len(raw.lstrip())
+                span_start = start + lead
+                spans.append(
+                    self.build_span(
+                        question, text, span_start, span_start + len(text), question_type
+                    )
+                )
 
         return spans
 
@@ -883,6 +897,34 @@ class DynamicSpanCompressor:
                     refined.extend(self.split_coordination_span(question, clause_span, question_type))
         return refined
 
+    def _child_span(
+        self,
+        question: str,
+        parent: SpanUnit,
+        rel_start: int,
+        rel_end: int,
+        question_type: str,
+        kind_override: str | None = None,
+    ) -> SpanUnit | None:
+        """Derive a sub-span from relative offsets into `parent.text`.
+
+        The refiners all slice parent.text, strip the slice, then previously
+        computed absolute offsets as `parent.start + rel_index` -- ignoring the
+        characters the strip removed. That shifted every derived span left by the
+        stripped whitespace, so span.start/end no longer described span.text
+        (finding D8). Since parent.start/end now describe parent.text exactly,
+        the only correction needed is for whitespace stripped off this slice.
+        """
+        raw = parent.text[rel_start:rel_end]
+        text = raw.strip()
+        if not text:
+            return None
+        lead = len(raw) - len(raw.lstrip())
+        start = parent.start + rel_start + lead
+        return self.build_span(
+            question, text, start, start + len(text), question_type, kind_override=kind_override
+        )
+
     def split_source_attribution_span(
         self,
         question: str,
@@ -899,13 +941,18 @@ class DynamicSpanCompressor:
         if not match or match.end() >= len(span.text) - 8:
             return [span]
 
-        lead_text = span.text[: match.end()].strip()
         evidence_text = span.text[match.end() :].strip()
         if self._count_tokens(evidence_text) < 6:
             return [span]
 
-        lead = self.build_span(question, lead_text, span.start, span.start + match.end(), question_type, kind_override="source_attribution")
-        evidence = self.build_span(question, evidence_text, span.start + match.end(), span.end, question_type)
+        lead = self._child_span(
+            question, span, 0, match.end(), question_type, kind_override="source_attribution"
+        )
+        evidence = self._child_span(
+            question, span, match.end(), len(span.text), question_type
+        )
+        if lead is None or evidence is None:
+            return [span]
         return [lead, evidence]
 
     def split_relative_or_contrast_clause(
@@ -930,8 +977,12 @@ class DynamicSpanCompressor:
         if self._count_tokens(lead_text) < 5 or self._count_tokens(tail_text) < 5:
             return [span]
 
-        lead = self.build_span(question, lead_text, span.start, span.start + match.start(), question_type)
-        tail = self.build_span(question, tail_text, span.start + match.start() + 1, span.end, question_type, kind_override="tail")
+        lead = self._child_span(question, span, 0, match.start(), question_type)
+        tail = self._child_span(
+            question, span, match.start() + 1, len(span.text), question_type, kind_override="tail"
+        )
+        if lead is None or tail is None:
+            return [span]
         return [lead, tail]
 
     def split_coordination_span(
@@ -957,8 +1008,12 @@ class DynamicSpanCompressor:
                 continue
             if len(tokenize_query_terms(tail_text)) < 2 and not re.search(r"\d", tail_text):
                 continue
-            lead = self.build_span(question, lead_text, span.start, span.start + match.start(), question_type)
-            tail = self.build_span(question, tail_text, span.start + match.start(), span.end, question_type, kind_override="tail")
+            lead = self._child_span(question, span, 0, match.start(), question_type)
+            tail = self._child_span(
+                question, span, match.start(), len(span.text), question_type, kind_override="tail"
+            )
+            if lead is None or tail is None:
+                continue
             return [lead, tail]
 
         return [span]
