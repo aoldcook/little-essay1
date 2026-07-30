@@ -19,8 +19,45 @@ class DacCompressionConfig:
     avoid_consecutive: bool = True
 
 
+# Parameter-name fragments belonging to a masked-LM prediction head. If any of
+# these are reported missing when loading, the head was randomly initialised.
+_LM_HEAD_KEY_HINTS = ("cls.predictions", "lm_head", "predictions.decoder", "mlm_head", "vocab_transform")
+
+
+def _lm_head_keys_missing(missing_keys: Sequence[str]) -> List[str]:
+    return [
+        key for key in (missing_keys or [])
+        if any(hint in key for hint in _LM_HEAD_KEY_HINTS)
+    ]
+
+
 class DacTokenAdapter:
-    def __init__(self, sentence_encoder, config: DacCompressionConfig | None = None):
+    """DAC-style token salience via masked-LM loss fused with attention.
+
+    IMPORTANT (EVAL_VALIDITY_AUDIT.md finding C6): the salience signal is only
+    meaningful if the masked-LM prediction head carries *trained* weights. The
+    Stage-1 encoder is saved with `AutoModel` (a bare encoder, no LM head), so
+    loading `AutoModelForMaskedLM` from that directory SUCCEEDS while silently
+    re-initialising `cls.predictions.*` at random. No exception is raised, and the
+    resulting scores are non-degenerate -- they vary across spans purely because
+    random-head cross-entropy depends on token identity and length. They therefore
+    look like a working signal in logs and contribute a nonzero `dac_score`
+    feature, while carrying no information about salience.
+
+    This class now detects that case and refuses to emit such scores. Set
+    `strict=True` to raise instead of disabling, or point `dac_model_name` at a
+    checkpoint that genuinely has a trained MLM head (e.g. the original
+    pretrained base model rather than the fine-tuned Stage-1 output).
+    """
+
+    def __init__(
+        self,
+        sentence_encoder,
+        config: DacCompressionConfig | None = None,
+        dac_model_name: str | None = None,
+        strict: bool = False,
+        verbose: bool = True,
+    ):
         self.sentence_encoder = sentence_encoder
         self.tokenizer = sentence_encoder.tokenizer
         self.encoder = sentence_encoder.encoder
@@ -30,32 +67,58 @@ class DacTokenAdapter:
         self.special_token_ids = set(getattr(self.tokenizer, "all_special_ids", []))
         self.available = False
         self.entropy_model = None
+        self.unavailable_reason: Optional[str] = None
+        self.dac_model_name = dac_model_name or sentence_encoder.config.model_name
 
-        if self.tokenizer.mask_token_id is not None:
+        if self.tokenizer.mask_token_id is None:
+            self.unavailable_reason = "tokenizer has no mask_token_id"
+            self._report(strict, verbose)
+            return
+
+        kwargs = dict(
+            cache_dir=getattr(sentence_encoder.config, "cache_dir", "") or None,
+            trust_remote_code=getattr(sentence_encoder.config, "trust_remote_code", True),
+            output_loading_info=True,
+        )
+        loading_info = None
+        try:
             try:
-                self.entropy_model = AutoModelForMaskedLM.from_pretrained(
-                    sentence_encoder.config.model_name,
-                    cache_dir=getattr(sentence_encoder.config, "cache_dir", "") or None,
-                    trust_remote_code=getattr(sentence_encoder.config, "trust_remote_code", True),
-                    attn_implementation="eager",
-                ).to(self.device)
-                self.entropy_model.eval()
-                self.available = True
+                self.entropy_model, loading_info = AutoModelForMaskedLM.from_pretrained(
+                    self.dac_model_name, attn_implementation="eager", **kwargs
+                )
             except TypeError:
-                try:
-                    self.entropy_model = AutoModelForMaskedLM.from_pretrained(
-                        sentence_encoder.config.model_name,
-                        cache_dir=getattr(sentence_encoder.config, "cache_dir", "") or None,
-                        trust_remote_code=getattr(sentence_encoder.config, "trust_remote_code", True),
-                    ).to(self.device)
-                    self.entropy_model.eval()
-                    self.available = True
-                except Exception:
-                    self.entropy_model = None
-                    self.available = False
-            except Exception:
-                self.entropy_model = None
-                self.available = False
+                self.entropy_model, loading_info = AutoModelForMaskedLM.from_pretrained(
+                    self.dac_model_name, **kwargs
+                )
+        except Exception as exc:
+            self.entropy_model = None
+            self.unavailable_reason = f"could not load MLM model: {type(exc).__name__}: {exc}"
+            self._report(strict, verbose)
+            return
+
+        # The load succeeded, but did the LM head actually come from the checkpoint?
+        missing = _lm_head_keys_missing((loading_info or {}).get("missing_keys", []))
+        if missing:
+            self.entropy_model = None
+            self.unavailable_reason = (
+                f"masked-LM head was randomly initialised when loading "
+                f"{self.dac_model_name!r} (missing: {missing[:4]}). DAC salience would "
+                f"be noise, so it is disabled. Pass dac_model_name=<pretrained base "
+                f"model with a trained MLM head> to enable it."
+            )
+            self._report(strict, verbose)
+            return
+
+        self.entropy_model = self.entropy_model.to(self.device)
+        self.entropy_model.eval()
+        self.available = True
+
+    def _report(self, strict: bool, verbose: bool) -> None:
+        message = f"DAC token salience DISABLED: {self.unavailable_reason}"
+        if strict:
+            raise RuntimeError(message)
+        if verbose:
+            print(f"[dac_adapter] WARNING: {message}", flush=True)
 
     def normalize(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.dim() == 0:
