@@ -1,12 +1,61 @@
-﻿from __future__ import annotations
+"""DAC-style token salience: masked-LM information content fused with question attention.
+
+Design notes (see EVAL_VALIDITY_AUDIT.md findings C6, D1-D8):
+
+D1  The salience model is now DECOUPLED from the Stage-1 sentence encoder. The
+    Stage-1 default is Qwen3-Embedding, a causal embedding model that has (a) no
+    mask token and (b) no entry in transformers' MaskedLM mapping. Pointing this
+    adapter at it therefore disabled DAC unconditionally, so every "DAC-guided"
+    run silently degraded to plain span pruning. `salience_model_name` now
+    defaults to a real encoder-MLM with trained head weights.
+
+D3  Loss tokens (salience tokenizer, text alone) and attention tokens (encoder
+    tokenizer, question+text pair) come from DIFFERENT tokenizers and are no
+    longer assumed to be positionally aligned. Attention is projected onto
+    CHARACTER offsets of `text` and then re-aggregated onto salience tokens, so
+    alignment is correct by construction. When the attention term is genuinely
+    unavailable the fusion RENORMALISES onto the loss term and records the fact,
+    instead of substituting zeros and pretending attention contributed.
+
+D4  `select_keep_indices` used to append "rescued" tokens on top of a full topk
+    budget, so the achieved keep-ratio exceeded the requested one. Rescues are
+    now compensated, keeping |keep| == keep_count exactly.
+
+D6  `compress` reused a protected_char_mask indexed against the ORIGINAL text on
+    every iteration, silently protecting the wrong characters from step 2 on.
+    The mask is now carried forward through each reconstruction.
+"""
+
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForMaskedLM
+from transformers import AutoModelForMaskedLM, AutoTokenizer
+
+
+# An encoder-MLM whose masked-LM head weights are actually published. Do not
+# swap this for a checkpoint saved via bare `AutoModel` -- the head would be
+# randomly re-initialised and the salience signal would be noise (guarded below).
+DEFAULT_SALIENCE_MODEL = "roberta-base"
+
+# Parameter-name fragments belonging to a masked-LM prediction head. If any of
+# these are reported missing when loading, the head was randomly initialised.
+_LM_HEAD_KEY_HINTS = ("cls.predictions", "lm_head", "predictions.decoder", "mlm_head", "vocab_transform")
+
+# Below this fraction of `text` covered by the attention pass we treat the
+# attention term as unavailable rather than as mostly-zeros.
+_MIN_ATTENTION_COVERAGE = 0.60
+
+
+def _lm_head_keys_missing(missing_keys: Sequence[str]) -> List[str]:
+    return [
+        key for key in (missing_keys or [])
+        if any(hint in key for hint in _LM_HEAD_KEY_HINTS)
+    ]
 
 
 @dataclass
@@ -17,37 +66,20 @@ class DacCompressionConfig:
     min_tokens: int = 6
     preserve_punct: bool = True
     avoid_consecutive: bool = True
-
-
-# Parameter-name fragments belonging to a masked-LM prediction head. If any of
-# these are reported missing when loading, the head was randomly initialised.
-_LM_HEAD_KEY_HINTS = ("cls.predictions", "lm_head", "predictions.decoder", "mlm_head", "vocab_transform")
-
-
-def _lm_head_keys_missing(missing_keys: Sequence[str]) -> List[str]:
-    return [
-        key for key in (missing_keys or [])
-        if any(hint in key for hint in _LM_HEAD_KEY_HINTS)
-    ]
+    # Masked-LM used for token information content. MUST have a trained MLM head.
+    salience_model_name: str = DEFAULT_SALIENCE_MODEL
+    # Raise instead of renormalising when the question-attention term is missing.
+    require_attention: bool = False
 
 
 class DacTokenAdapter:
-    """DAC-style token salience via masked-LM loss fused with attention.
+    """Token salience = fuse(masked-LM information content, question attention).
 
-    IMPORTANT (EVAL_VALIDITY_AUDIT.md finding C6): the salience signal is only
-    meaningful if the masked-LM prediction head carries *trained* weights. The
-    Stage-1 encoder is saved with `AutoModel` (a bare encoder, no LM head), so
-    loading `AutoModelForMaskedLM` from that directory SUCCEEDS while silently
-    re-initialising `cls.predictions.*` at random. No exception is raised, and the
-    resulting scores are non-degenerate -- they vary across spans purely because
-    random-head cross-entropy depends on token identity and length. They therefore
-    look like a working signal in logs and contribute a nonzero `dac_score`
-    feature, while carrying no information about salience.
-
-    This class now detects that case and refuses to emit such scores. Set
-    `strict=True` to raise instead of disabling, or point `dac_model_name` at a
-    checkpoint that genuinely has a trained MLM head (e.g. the original
-    pretrained base model rather than the fine-tuned Stage-1 output).
+    The masked-LM term needs one forward pass per masked position, so it is
+    O(n) forwards for an n-token input. It is applied per SENTENCE (short n),
+    not per context, which keeps this tractable -- but it is still by far the
+    most expensive signal in the pipeline and must be reported as such in any
+    latency table.
     """
 
     def __init__(
@@ -59,40 +91,85 @@ class DacTokenAdapter:
         verbose: bool = True,
     ):
         self.sentence_encoder = sentence_encoder
-        self.tokenizer = sentence_encoder.tokenizer
-        self.encoder = sentence_encoder.encoder
-        self.device = sentence_encoder.device
-        self.max_length = sentence_encoder.config.max_length
         self.config = config or DacCompressionConfig()
-        self.special_token_ids = set(getattr(self.tokenizer, "all_special_ids", []))
-        self.available = False
-        self.entropy_model = None
-        self.unavailable_reason: Optional[str] = None
-        self.dac_model_name = dac_model_name or sentence_encoder.config.model_name
 
-        if self.tokenizer.mask_token_id is None:
-            self.unavailable_reason = "tokenizer has no mask_token_id"
+        # Encoder side: used ONLY for question->token attention.
+        self.encoder = sentence_encoder.encoder
+        self.encoder_tokenizer = sentence_encoder.tokenizer
+        self.device = sentence_encoder.device
+        self.encoder_max_length = sentence_encoder.config.max_length
+        self.special_token_ids = set(getattr(self.encoder_tokenizer, "all_special_ids", []))
+
+        # Salience side: an independent masked-LM.
+        self.salience_model_name = dac_model_name or self.config.salience_model_name
+        self.salience_tokenizer = None
+        self.entropy_model = None
+        self.max_length = self.encoder_max_length
+
+        self.available = False
+        self.unavailable_reason: Optional[str] = None
+        # Populated per call so provenance reflects what actually happened.
+        self.attention_available: Optional[bool] = None
+        self.attention_unavailable_reason: Optional[str] = None
+
+        self._load_salience_model(strict=strict, verbose=verbose)
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+
+    def _load_salience_model(self, strict: bool, verbose: bool) -> None:
+        try:
+            self.salience_tokenizer = AutoTokenizer.from_pretrained(
+                self.salience_model_name,
+                cache_dir=getattr(self.sentence_encoder.config, "cache_dir", "") or None,
+                use_fast=True,
+            )
+        except Exception as exc:
+            self.unavailable_reason = (
+                f"could not load salience tokenizer {self.salience_model_name!r}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            self._report(strict, verbose)
+            return
+
+        if self.salience_tokenizer.mask_token_id is None:
+            self.unavailable_reason = (
+                f"salience tokenizer {self.salience_model_name!r} has no mask token, so "
+                "per-token masked-LM scoring is impossible. Use an encoder-MLM "
+                "(e.g. roberta-base, bert-base-uncased), not a causal/embedding model."
+            )
+            self._report(strict, verbose)
+            return
+
+        if not getattr(self.salience_tokenizer, "is_fast", False):
+            self.unavailable_reason = (
+                f"salience tokenizer {self.salience_model_name!r} is not a fast tokenizer; "
+                "character offsets are required for span alignment."
+            )
             self._report(strict, verbose)
             return
 
         kwargs = dict(
-            cache_dir=getattr(sentence_encoder.config, "cache_dir", "") or None,
-            trust_remote_code=getattr(sentence_encoder.config, "trust_remote_code", True),
+            cache_dir=getattr(self.sentence_encoder.config, "cache_dir", "") or None,
             output_loading_info=True,
         )
         loading_info = None
         try:
             try:
                 self.entropy_model, loading_info = AutoModelForMaskedLM.from_pretrained(
-                    self.dac_model_name, attn_implementation="eager", **kwargs
+                    self.salience_model_name, attn_implementation="eager", **kwargs
                 )
             except TypeError:
                 self.entropy_model, loading_info = AutoModelForMaskedLM.from_pretrained(
-                    self.dac_model_name, **kwargs
+                    self.salience_model_name, **kwargs
                 )
         except Exception as exc:
             self.entropy_model = None
-            self.unavailable_reason = f"could not load MLM model: {type(exc).__name__}: {exc}"
+            self.unavailable_reason = (
+                f"could not load a masked-LM from {self.salience_model_name!r}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             self._report(strict, verbose)
             return
 
@@ -102,12 +179,18 @@ class DacTokenAdapter:
             self.entropy_model = None
             self.unavailable_reason = (
                 f"masked-LM head was randomly initialised when loading "
-                f"{self.dac_model_name!r} (missing: {missing[:4]}). DAC salience would "
-                f"be noise, so it is disabled. Pass dac_model_name=<pretrained base "
-                f"model with a trained MLM head> to enable it."
+                f"{self.salience_model_name!r} (missing: {missing[:4]}). DAC salience "
+                f"would be noise, so it is disabled. Point --dac_salience_model at a "
+                f"checkpoint that publishes trained MLM head weights."
             )
             self._report(strict, verbose)
             return
+
+        # roberta-base et al. cap out at 512 positions; never exceed the model.
+        model_cap = int(getattr(self.salience_tokenizer, "model_max_length", 512) or 512)
+        if model_cap > 100_000:  # sentinel used by some tokenizers
+            model_cap = 512
+        self.max_length = max(8, min(self.encoder_max_length, model_cap))
 
         self.entropy_model = self.entropy_model.to(self.device)
         self.entropy_model.eval()
@@ -120,6 +203,23 @@ class DacTokenAdapter:
         if verbose:
             print(f"[dac_adapter] WARNING: {message}", flush=True)
 
+    def provenance(self) -> Dict[str, object]:
+        """What actually ran. Belongs in the run manifest."""
+        return {
+            "dac_available": bool(self.available),
+            "dac_salience_model": self.salience_model_name,
+            "dac_unavailable_reason": self.unavailable_reason,
+            "dac_fusion": self.config.fusion,
+            "dac_alpha": self.config.alpha,
+            "dac_attention_available": self.attention_available,
+            "dac_attention_unavailable_reason": self.attention_unavailable_reason,
+            "dac_max_length": self.max_length,
+        }
+
+    # ------------------------------------------------------------------
+    # Scoring primitives
+    # ------------------------------------------------------------------
+
     def normalize(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.dim() == 0:
             tensor = tensor.unsqueeze(0)
@@ -129,27 +229,23 @@ class DacTokenAdapter:
             return (tensor - min_val) / (max_val - min_val)
         return torch.zeros_like(tensor)
 
-    def _fuse_additive(self, losses: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
-        loss_norm = self.normalize(losses)
-        attn_norm = self.normalize(attention)
-        return self.config.alpha * attn_norm + (1.0 - self.config.alpha) * loss_norm
-
-    def _fuse_multiplicative(self, losses: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
-        loss_norm = self.normalize(losses)
-        attn_norm = self.normalize(attention)
-        return loss_norm * attn_norm
-
     def _token_count(self, text: str) -> int:
+        tokenizer = self.salience_tokenizer or self.encoder_tokenizer
         try:
-            return len(self.tokenizer.tokenize(text))
+            return len(tokenizer.tokenize(text))
         except Exception:
-            return len(text)
+            # Whitespace words, NOT len(text): characters would inflate the count
+            # by ~5x and saturate dyn_steps.
+            return len(text.split())
 
-    def compute_token_losses(self, text: str) -> tuple[Optional[torch.Tensor], Optional[List[List[int]]]]:
+    def compute_token_losses(
+        self, text: str
+    ) -> Tuple[Optional[torch.Tensor], Optional[List[List[int]]]]:
+        """Masked-LM cross-entropy per token, with character offsets into `text`."""
         if not self.available or not text.strip():
             return None, None
 
-        encoding = self.tokenizer(
+        encoding = self.salience_tokenizer(
             text,
             add_special_tokens=False,
             truncation=True,
@@ -167,7 +263,7 @@ class DacTokenAdapter:
         if seq_len < self.config.min_tokens:
             return None, offsets
 
-        mask_token_id = self.tokenizer.mask_token_id
+        mask_token_id = self.salience_tokenizer.mask_token_id
         target_ids = input_ids[0]
         losses = []
         chunk_size = 32
@@ -194,24 +290,43 @@ class DacTokenAdapter:
 
         return torch.cat(losses, dim=0), offsets
 
-    def compute_token_attention(self, question: str, text: str) -> Optional[torch.Tensor]:
-        if not text.strip() or not getattr(self.tokenizer, "is_fast", False):
+    def compute_char_attention(self, question: str, text: str) -> Optional[List[float]]:
+        """Question-attention projected onto CHARACTER positions of `text`.
+
+        Returning a per-character array makes the result independent of the
+        encoder's tokenisation, so it can be re-aggregated onto salience tokens
+        (or spans) without any positional-alignment assumption.
+        """
+        self.attention_available = False
+        self.attention_unavailable_reason = None
+
+        if not text.strip():
+            self.attention_unavailable_reason = "empty text"
+            return None
+        if not getattr(self.encoder_tokenizer, "is_fast", False):
+            self.attention_unavailable_reason = "encoder tokenizer is not fast (no offsets)"
             return None
 
         try:
-            encoded_question = self.sentence_encoder.format_query(question) if hasattr(self.sentence_encoder, "format_query") else question
-            batch = self.tokenizer(
+            encoded_question = (
+                self.sentence_encoder.format_query(question)
+                if hasattr(self.sentence_encoder, "format_query")
+                else question
+            )
+            batch = self.encoder_tokenizer(
                 encoded_question,
                 text,
-                truncation=True,
-                max_length=self.max_length,
+                truncation="only_first",
+                max_length=self.encoder_max_length,
                 return_tensors="pt",
                 return_offsets_mapping=True,
             )
-        except Exception:
+        except Exception as exc:
+            self.attention_unavailable_reason = f"tokenisation failed: {type(exc).__name__}: {exc}"
             return None
 
         if not getattr(batch, "encodings", None):
+            self.attention_unavailable_reason = "tokenizer returned no encodings"
             return None
 
         encoding = batch.encodings[0]
@@ -229,6 +344,9 @@ class DacTokenAdapter:
 
         attentions = getattr(outputs, "attentions", None)
         if not attentions:
+            self.attention_unavailable_reason = (
+                "encoder returned no attentions (needs attn_implementation='eager')"
+            )
             return None
 
         attn = torch.stack([layer[0].mean(dim=0) for layer in attentions[-2:]], dim=0).mean(dim=0)
@@ -238,36 +356,105 @@ class DacTokenAdapter:
             if seq_id == 0 and offset[1] > offset[0] and input_id not in self.special_token_ids
         ]
         if not question_indices:
+            self.attention_unavailable_reason = "no question tokens identified"
             return None
 
-        token_scores = []
+        char_total = [0.0] * len(text)
+        char_count = [0] * len(text)
+        covered = 0
         for idx, (seq_id, offset, input_id) in enumerate(zip(sequence_ids, offsets, input_ids)):
             if seq_id != 1 or offset[1] <= offset[0] or input_id in self.special_token_ids:
                 continue
             q_to_token = float(attn[question_indices][:, [idx]].mean().item())
             ctx_to_token = float(attn[:, [idx]].mean().item())
-            token_scores.append(0.75 * q_to_token + 0.25 * ctx_to_token)
+            score = 0.75 * q_to_token + 0.25 * ctx_to_token
+            start, end = int(offset[0]), min(int(offset[1]), len(text))
+            for pos in range(start, end):
+                char_total[pos] += score
+                char_count[pos] += 1
+                covered += 1
 
-        if not token_scores:
+        if covered == 0:
+            self.attention_unavailable_reason = "no context tokens survived filtering"
             return None
-        return torch.tensor(token_scores, dtype=torch.float32, device=self.device)
 
-    def compute_fused_token_scores(self, question: str, text: str):
+        non_space = max(sum(1 for ch in text if not ch.isspace()), 1)
+        coverage = min(1.0, covered / non_space)
+        if coverage < _MIN_ATTENTION_COVERAGE:
+            # The pair encoding truncated most of the context. Mostly-zero
+            # attention is worse than no attention: renormalise onto loss.
+            self.attention_unavailable_reason = (
+                f"attention covered only {coverage:.2f} of the text (truncated); "
+                f"below the {_MIN_ATTENTION_COVERAGE:.2f} threshold"
+            )
+            return None
+
+        self.attention_available = True
+        return [
+            (char_total[pos] / char_count[pos]) if char_count[pos] else 0.0
+            for pos in range(len(text))
+        ]
+
+    @staticmethod
+    def _aggregate_chars(
+        char_values: Sequence[float], start: int, end: int
+    ) -> Optional[float]:
+        lo, hi = max(0, int(start)), min(len(char_values), int(end))
+        if hi <= lo:
+            return None
+        window = [char_values[pos] for pos in range(lo, hi)]
+        return sum(window) / len(window) if window else None
+
+    def _attention_for_offsets(
+        self, char_attention: Sequence[float], offsets: Sequence[Sequence[int]]
+    ) -> torch.Tensor:
+        values = []
+        for start, end in offsets:
+            mean = self._aggregate_chars(char_attention, start, end)
+            values.append(0.0 if mean is None else mean)
+        return torch.tensor(values, dtype=torch.float32, device=self.device)
+
+    def _fuse(
+        self,
+        losses: torch.Tensor,
+        attention: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        loss_norm = self.normalize(losses)
+        if attention is None:
+            if self.config.require_attention:
+                raise RuntimeError(
+                    "DAC question-attention unavailable "
+                    f"({self.attention_unavailable_reason}) and require_attention=True."
+                )
+            # Renormalise onto the loss term rather than fusing against zeros.
+            return loss_norm
+        attn_norm = self.normalize(attention)
+        if self.config.fusion == "multiplicative":
+            return loss_norm * attn_norm
+        return self.config.alpha * attn_norm + (1.0 - self.config.alpha) * loss_norm
+
+    def compute_fused_token_scores(
+        self, question: str, text: str
+    ) -> Tuple[Optional[torch.Tensor], Optional[List[List[int]]]]:
         losses, offsets = self.compute_token_losses(text)
         if losses is None or offsets is None:
             return None, None
 
-        attention = self.compute_token_attention(question, text)
-        if attention is None or attention.numel() != losses.numel():
-            attention = torch.zeros_like(losses)
-
-        if self.config.fusion == "multiplicative":
-            fused = self._fuse_multiplicative(losses, attention)
-        else:
-            fused = self._fuse_additive(losses, attention)
-        return fused, offsets
+        char_attention = self.compute_char_attention(question, text)
+        attention = (
+            self._attention_for_offsets(char_attention, offsets)
+            if char_attention is not None
+            else None
+        )
+        return self._fuse(losses, attention), offsets
 
     def score_spans(self, question: str, text: str, spans) -> Optional[List[float]]:
+        """Mean fused salience per span.
+
+        `spans` must carry .start/.end offsets INTO `text`. Passing a different
+        string than the one the spans were built from silently misattributes
+        salience, so callers must hand over the original sentence.
+        """
         fused, offsets = self.compute_fused_token_scores(question, text)
         if fused is None or offsets is None:
             return None
@@ -284,6 +471,10 @@ class DacTokenAdapter:
                 continue
             scores.append(float(fused[token_indices].mean().item()))
         return scores
+
+    # ------------------------------------------------------------------
+    # Iterative token-level compression
+    # ------------------------------------------------------------------
 
     def preserve_punctuation_mask(self, text: str, offsets: Sequence[Sequence[int]]) -> torch.Tensor:
         punct_pattern = re.compile(r"^\s*[^\w\s]+\s*$")
@@ -318,39 +509,69 @@ class DacTokenAdapter:
         punct_mask: torch.Tensor,
         protect_mask: torch.Tensor,
     ) -> torch.Tensor:
-        total_tokens = score.numel()
-        keep_count = max(1, int(total_tokens * (1 - compress_ratio)))
-        working_score = score.clone()
-        if self.config.preserve_punct:
-            working_score = working_score + 1e5 * punct_mask.float()
-        working_score = working_score + 1e5 * protect_mask.float()
+        """Top-k keep selection that HONOURS the requested budget.
 
-        _, keep_indices = torch.topk(working_score.view(-1), k=keep_count, largest=True)
-        keep_indices = torch.sort(keep_indices)[0]
+        Punctuation/protected tokens are force-kept. The `avoid_consecutive`
+        rescue then trades tokens rather than appending them, so the achieved
+        keep-count equals the requested keep-count (finding D4).
+        """
+        total_tokens = score.numel()
+        keep_count = max(1, int(round(total_tokens * (1 - compress_ratio))))
+        keep_count = min(keep_count, total_tokens)
+
+        forced = protect_mask.clone()
+        if self.config.preserve_punct:
+            forced = forced | punct_mask
+
+        working_score = score.clone().float()
+        working_score = working_score + 1e5 * forced.float()
+
+        _, topk = torch.topk(working_score.view(-1), k=keep_count, largest=True)
+        keep_mask = torch.zeros(total_tokens, dtype=torch.bool, device=score.device)
+        keep_mask[topk] = True
 
         if not self.config.avoid_consecutive:
-            return keep_indices
+            return torch.nonzero(keep_mask, as_tuple=False).view(-1).sort()[0]
 
-        all_indices = torch.arange(total_tokens, device=self.device)
-        delete_indices = all_indices[~torch.isin(all_indices, keep_indices)]
-        if delete_indices.numel() <= 1:
-            return keep_indices
+        # Rescue the first token of each run of >=2 consecutive deletions, then
+        # pay for each rescue by dropping the lowest-scoring non-forced keep.
+        deleted = torch.nonzero(~keep_mask, as_tuple=False).view(-1)
+        if deleted.numel() <= 1:
+            return torch.nonzero(keep_mask, as_tuple=False).view(-1).sort()[0]
 
-        differences = delete_indices[1:] - delete_indices[:-1]
-        extra_keep_mask = torch.zeros_like(delete_indices, dtype=torch.bool)
-        extra_keep_mask[1:] = differences == 1
-        extra_keep_mask[0] = False
+        rescues: List[int] = []
+        run_len = 1
+        for pos in range(1, deleted.numel()):
+            if int(deleted[pos]) == int(deleted[pos - 1]) + 1:
+                run_len += 1
+                if run_len == 2:
+                    rescues.append(int(deleted[pos - 1]))
+            else:
+                run_len = 1
 
-        for idx in range(1, extra_keep_mask.numel()):
-            if extra_keep_mask[idx - 1]:
-                extra_keep_mask[idx] = False
+        for rescue_idx in rescues:
+            droppable = torch.nonzero(keep_mask & ~forced, as_tuple=False).view(-1)
+            if droppable.numel() == 0:
+                break
+            victim = droppable[torch.argmin(score[droppable])]
+            if float(score[victim]) >= float(score[rescue_idx]):
+                continue  # trade would lower total salience; skip this rescue
+            keep_mask[victim] = False
+            keep_mask[rescue_idx] = True
 
-        rescued_indices = delete_indices[extra_keep_mask]
-        if rescued_indices.numel() == 0:
-            return keep_indices
-        return torch.sort(torch.cat((keep_indices, rescued_indices)))[0]
+        return torch.nonzero(keep_mask, as_tuple=False).view(-1).sort()[0]
 
-    def reconstruct_text(self, text: str, offsets: Sequence[Sequence[int]], keep_indices: Sequence[int]) -> str:
+    def reconstruct_text(
+        self,
+        text: str,
+        offsets: Sequence[Sequence[int]],
+        keep_indices: Sequence[int],
+    ) -> Tuple[str, List[int]]:
+        """Return the kept text AND the original char positions it came from.
+
+        The position list lets callers carry a character-aligned mask (e.g. the
+        protected-entity mask) forward across iterations (finding D6).
+        """
         char_keep = [False] * len(text)
         for idx in keep_indices:
             start, end = offsets[int(idx)]
@@ -358,17 +579,27 @@ class DacTokenAdapter:
                 if 0 <= pos < len(char_keep):
                     char_keep[pos] = True
 
-        chars = []
+        chars: List[str] = []
+        positions: List[int] = []
         for pos, ch in enumerate(text):
             if char_keep[pos]:
                 chars.append(ch)
+                positions.append(pos)
                 continue
             if ch.isspace() and (
                 (pos > 0 and char_keep[pos - 1])
                 or (pos + 1 < len(char_keep) and char_keep[pos + 1])
             ):
                 chars.append(ch)
-        return "".join(chars).strip()
+                positions.append(pos)
+
+        joined = "".join(chars)
+        stripped = joined.strip()
+        # Keep `positions` aligned to `stripped` after strip().
+        lead = len(joined) - len(joined.lstrip())
+        trail = len(joined) - len(joined.rstrip())
+        positions = positions[lead: len(positions) - trail] if trail else positions[lead:]
+        return stripped, positions
 
     def compress(
         self,
@@ -381,6 +612,13 @@ class DacTokenAdapter:
             return None
 
         current_text = text
+        # Mask stays aligned to current_text across iterations (finding D6).
+        current_protect: Optional[List[bool]] = (
+            list(protected_char_mask[: len(text)]) + [False] * max(0, len(text) - len(protected_char_mask))
+            if protected_char_mask is not None
+            else None
+        )
+
         compress_ratio = max(0.0, 1.0 - keep_ratio)
         seq_len = self._token_count(text)
         if seq_len < self.config.min_tokens:
@@ -388,28 +626,37 @@ class DacTokenAdapter:
 
         dyn_steps = min(max(1, seq_len // 12), self.config.max_dyn_steps)
         real_ratio = 1.0 - (1.0 - compress_ratio) ** (1.0 / dyn_steps)
+        steps_run = 0
 
         for _ in range(dyn_steps):
             losses, offsets = self.compute_token_losses(current_text)
             if losses is None or offsets is None or losses.numel() < self.config.min_tokens:
                 break
 
-            attention = self.compute_token_attention(question, current_text)
-            if attention is None or attention.numel() != losses.numel():
-                attention = torch.zeros_like(losses)
-
-            if self.config.fusion == "multiplicative":
-                fused_score = self._fuse_multiplicative(losses, attention)
-            else:
-                fused_score = self._fuse_additive(losses, attention)
+            char_attention = self.compute_char_attention(question, current_text)
+            attention = (
+                self._attention_for_offsets(char_attention, offsets)
+                if char_attention is not None
+                else None
+            )
+            fused_score = self._fuse(losses, attention)
 
             punct_mask = self.preserve_punctuation_mask(current_text, offsets)
-            protect_mask = self.protected_token_mask(offsets, protected_char_mask)
+            protect_mask = self.protected_token_mask(offsets, current_protect)
             keep_indices = self.select_keep_indices(fused_score, real_ratio, punct_mask, protect_mask)
-            next_text = self.reconstruct_text(current_text, offsets, keep_indices.tolist())
+            next_text, kept_positions = self.reconstruct_text(
+                current_text, offsets, keep_indices.tolist()
+            )
             if not next_text or next_text == current_text:
                 break
+
+            if current_protect is not None:
+                current_protect = [
+                    current_protect[pos] if pos < len(current_protect) else False
+                    for pos in kept_positions
+                ]
             current_text = next_text
+            steps_run += 1
 
         if current_text == text:
             return None
@@ -417,9 +664,8 @@ class DacTokenAdapter:
         return {
             "compressed_text": current_text,
             "dyn_steps": dyn_steps,
+            "steps_run": steps_run,
             "fusion": self.config.fusion,
             "alpha": self.config.alpha,
+            "attention_available": self.attention_available,
         }
-
-
-

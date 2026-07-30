@@ -88,6 +88,32 @@ def main() -> None:
     print(f"feature_schema_version={FEATURE_SCHEMA_VERSION} num_features={len(FEATURE_ORDER)}")
 
     rows = load_jsonl(Path(args.train_file))
+
+    # The dac_score column is only meaningful if the whole training file was
+    # generated under one DAC regime. A file mixing DAC-on and DAC-off rows has
+    # two different feature distributions stacked in one column.
+    dac_flags = {bool(r.get("dac_active")) for r in rows if "dac_active" in r}
+    if len(dac_flags) > 1:
+        raise SystemExit(
+            "Training file mixes dac_active=True and dac_active=False rows, so the "
+            "dac_score feature has two different distributions in one column. "
+            "Regenerate pseudo-labels under a single DAC configuration."
+        )
+    dac_active = next(iter(dac_flags)) if dac_flags else None
+    dac_models = {
+        str(r.get("dac_salience_model")) for r in rows if r.get("dac_salience_model")
+    }
+    dac_salience_model = next(iter(dac_models)) if len(dac_models) == 1 else None
+    if dac_active is None:
+        print(
+            "\n*** WARNING: pseudo-labels carry no 'dac_active' flag (generated before "
+            "DAC was functional). The checkpoint will record dac_active=None and will "
+            "be REFUSED at inference when DAC is enabled. Regenerate pseudo-labels to "
+            "train a DAC-aware span model. ***\n"
+        )
+    else:
+        print(f"dac_active={dac_active} dac_salience_model={dac_salience_model}")
+
     if args.split_mode == "group":
         X_train, y_train, X_dev, y_dev, split_stats = build_xy_group_disjoint(
             rows, args.dev_ratio, seed=args.seed
@@ -211,7 +237,18 @@ def main() -> None:
         model.load_state_dict(best_state)
     torch.save(model.state_dict(), output_dir / "span_model.pt")
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
-        json.dump(build_metadata(config, FEATURE_ORDER, threshold=0.5), f, ensure_ascii=False, indent=2)
+        json.dump(
+            build_metadata(
+                config,
+                FEATURE_ORDER,
+                threshold=0.5,
+                dac_active=dac_active,
+                dac_salience_model=dac_salience_model,
+            ),
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     print("saved:", output_dir / "span_model.pt")
     print("saved:", output_dir / "metadata.json")

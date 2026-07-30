@@ -15,6 +15,7 @@ from context_aware_encoder_model.context_aware_sentence_encoder import (
     build_marked_context_window,
     split_sentences,
 )
+from pipeline.dac_adapter import DacCompressionConfig
 from pipeline.task_aware_compression import (
     DynamicSpanCompressor,
     IntraSentenceCompressionConfig,
@@ -412,6 +413,12 @@ class ContextAwareCompressor:
         second_stage_max_keep_ratio: float = 0.76,
         span_model_dir: Optional[str] = None,
         allow_heuristic_fallback: bool = False,
+        enable_dac: bool = True,
+        dac_salience_model: Optional[str] = None,
+        dac_fusion: str = "additive",
+        dac_alpha: float = 0.8,
+        dac_require_attention: bool = False,
+        dac_strict: bool = False,
     ):
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.window_max_chars = window_max_chars
@@ -487,7 +494,21 @@ class ContextAwareCompressor:
                 max_keep_ratio=second_stage_max_keep_ratio,
                 probe_layers=attention_probe_layers,
             )
-            self.span_compressor = DynamicSpanCompressor(self.encoder, span_config, span_model_dir=span_model_dir)
+            dac_config = DacCompressionConfig(
+                fusion=dac_fusion,
+                alpha=dac_alpha,
+                require_attention=dac_require_attention,
+            )
+            if dac_salience_model:
+                dac_config.salience_model_name = dac_salience_model
+            self.span_compressor = DynamicSpanCompressor(
+                self.encoder,
+                span_config,
+                span_model_dir=span_model_dir,
+                dac_config=dac_config,
+                dac_strict=dac_strict,
+                enable_dac=enable_dac,
+            )
 
         self.encoder_requested = str(encoder_dir)
         self.span_model_dir = span_model_dir

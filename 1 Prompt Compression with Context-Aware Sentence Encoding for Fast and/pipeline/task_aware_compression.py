@@ -9,7 +9,7 @@ import torch
 
 from intra_sentence_model.span_feature_utils import build_span_feature_dict, features_to_vector
 from intra_sentence_model.span_model import load_span_model
-from pipeline.dac_adapter import DacTokenAdapter
+from pipeline.dac_adapter import DacCompressionConfig, DacTokenAdapter
 
 
 QUESTION_STOPWORDS = {
@@ -316,8 +316,39 @@ class SpanUnit:
     protected: bool = False
 
 
+class _DisabledDac:
+    """Explicit no-op stand-in used when DAC is deliberately switched off.
+
+    Deliberate absence and accidental failure must not look alike downstream, so
+    this reports `deliberately_disabled` in provenance rather than reusing the
+    adapter's failure path.
+    """
+
+    available = False
+    unavailable_reason = "deliberately_disabled"
+    attention_available = None
+
+    def score_spans(self, question: str, text: str, spans) -> None:
+        return None
+
+    def compress(self, *args, **kwargs) -> None:
+        return None
+
+    def provenance(self) -> dict:
+        return {"dac_available": False, "dac_unavailable_reason": self.unavailable_reason}
+
+
 class DynamicSpanCompressor:
-    def __init__(self, sentence_encoder, config: IntraSentenceCompressionConfig | None = None, span_model_dir: str | None = None):
+    def __init__(
+        self,
+        sentence_encoder,
+        config: IntraSentenceCompressionConfig | None = None,
+        span_model_dir: str | None = None,
+        dac_config: DacCompressionConfig | None = None,
+        dac_model_name: str | None = None,
+        dac_strict: bool = False,
+        enable_dac: bool = True,
+    ):
         self.sentence_encoder = sentence_encoder
         self.encoder = sentence_encoder.encoder
         self.tokenizer = sentence_encoder.tokenizer
@@ -325,7 +356,15 @@ class DynamicSpanCompressor:
         self.max_length = sentence_encoder.config.max_length
         self.config = config or IntraSentenceCompressionConfig()
         self.special_token_ids = set(getattr(self.tokenizer, "all_special_ids", []))
-        self.dac_adapter = DacTokenAdapter(sentence_encoder)
+        # DAC salience uses its own masked-LM, independent of the Stage-1 encoder.
+        self.enable_dac = enable_dac
+        self.dac_offset_mismatch: bool | None = None
+        self.dac_adapter = DacTokenAdapter(
+            sentence_encoder,
+            config=dac_config,
+            dac_model_name=dac_model_name,
+            strict=dac_strict,
+        ) if enable_dac else _DisabledDac()
         self.learned_span_model = None
         self.learned_span_metadata = None
         self.learned_span_threshold = 0.5
@@ -342,7 +381,11 @@ class DynamicSpanCompressor:
         explicitly requested component must never vanish quietly.
         """
         try:
-            model, metadata = load_span_model(span_model_dir, self.device)
+            model, metadata = load_span_model(
+                span_model_dir,
+                self.device,
+                runtime_dac_active=bool(getattr(self.dac_adapter, "available", False)),
+            )
         except Exception as exc:
             self.learned_span_model = None
             self.learned_span_metadata = None
@@ -510,7 +553,10 @@ class DynamicSpanCompressor:
         skipped_by_safety = 0
 
         while len(current_spans) > 1 and self._count_span_tokens(current_spans) > target_tokens:
-            ranked_candidates = self.rank_removal_candidates(question, current_spans, question_type, sentence_score, keep_ratio)
+            ranked_candidates = self.rank_removal_candidates(
+                question, current_spans, question_type, sentence_score, keep_ratio,
+                sentence=original,
+            )
             if not ranked_candidates:
                 break
 
@@ -552,9 +598,10 @@ class DynamicSpanCompressor:
         question_type: str,
         sentence_score: float,
         keep_ratio: float,
+        sentence: str | None = None,
     ) -> List[Tuple[float, int, str]]:
         attention_scores = normalize_scores(self.compute_span_attention_scores(question, spans))
-        dac_scores = normalize_scores(self.compute_dac_span_scores(question, spans))
+        dac_scores = normalize_scores(self.compute_dac_span_scores(question, spans, sentence=sentence))
         overlap_scores = [query_overlap_score(question, span.text) for span in spans]
         anchor_scores = [task_anchor_score(question, span.text, question_type) for span in spans]
         reward_scores = normalize_scores([compute_task_reward(question, span.text, question_type) for span in spans])
@@ -999,8 +1046,30 @@ class DynamicSpanCompressor:
         self,
         question: str,
         spans: Sequence[SpanUnit],
+        sentence: str | None = None,
     ) -> List[float]:
-        sentence = " ".join(span.text for span in spans)
+        """Per-span DAC salience.
+
+        `spans` carry .start/.end offsets into the ORIGINAL sentence, so that
+        exact string must be passed through. Rebuilding it as
+        `" ".join(span.text ...)` -- as this did previously -- produces a
+        different string whenever spans do not tile the sentence with single
+        spaces, silently attributing each span's salience to the wrong tokens
+        (finding D8). If the offsets do not check out we return zeros rather
+        than scoring against a string the offsets do not describe.
+        """
+        if not spans:
+            return []
+        if sentence is None:
+            self.dac_offset_mismatch = True
+            return [0.0 for _ in spans]
+
+        for span in spans:
+            if sentence[span.start:span.end] != span.text:
+                self.dac_offset_mismatch = True
+                return [0.0 for _ in spans]
+
+        self.dac_offset_mismatch = False
         dac_scores = self.dac_adapter.score_spans(question, sentence, spans)
         if dac_scores is None:
             return [0.0 for _ in spans]

@@ -506,6 +506,13 @@ def main() -> None:
                     "source_role": training_sentence.role,
                     "selected_sentence_index": sent_idx,
                     "label_policy": args.label_policy,
+                    # Whether dac_score in `spans[*].features` carries real salience
+                    # or a constant 0.0. train_span_model stamps this into the
+                    # checkpoint so inference cannot silently change the regime.
+                    "dac_active": bool(getattr(compressor.dac_adapter, "available", False)),
+                    "dac_salience_model": getattr(
+                        compressor.dac_adapter, "salience_model_name", None
+                    ),
                 }
                 out_f.write(json.dumps(output_row, ensure_ascii=False) + "\n")
                 written_examples += 1

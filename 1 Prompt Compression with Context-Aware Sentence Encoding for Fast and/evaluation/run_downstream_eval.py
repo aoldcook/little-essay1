@@ -223,6 +223,12 @@ def build_compressors(args: argparse.Namespace, resolved) -> Dict[str, object]:
         # Fallback is pre-authorised only because resolve_encoder_source already
         # enforced the policy above; the contract decision is made once, there.
         allow_heuristic_fallback=resolved.is_lexical,
+        enable_dac=not args.disable_dac,
+        dac_salience_model=args.dac_salience_model,
+        dac_fusion=args.dac_fusion,
+        dac_alpha=args.dac_alpha,
+        dac_require_attention=args.dac_require_attention,
+        dac_strict=args.dac_strict,
     )
     stage1 = ContextAwareCompressor(enable_second_stage=False, **common)
     full = ContextAwareCompressor(
@@ -234,6 +240,25 @@ def build_compressors(args: argparse.Namespace, resolved) -> Dict[str, object]:
         **common,
     )
     return {"compressor_stage1": stage1, "compressor_full": full}
+
+
+def dac_provenance(ctx: Dict) -> Optional[Dict[str, object]]:
+    """Whether the DAC salience signal was actually live during the run.
+
+    Recorded in the manifest so a "DAC-guided" result can never be reported
+    without evidence that DAC loaded (audit finding D1: it used to disable
+    itself silently and no artefact showed that).
+    """
+    compressor = ctx.get("compressor_full")
+    span_compressor = getattr(compressor, "span_compressor", None)
+    adapter = getattr(span_compressor, "dac_adapter", None)
+    if adapter is None:
+        return None
+    record = dict(adapter.provenance())
+    record["span_offset_mismatch_seen"] = getattr(
+        span_compressor, "dac_offset_mismatch", None
+    )
+    return record
 
 
 def evaluate_method(
@@ -302,7 +327,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Downstream QA evaluation of context compression with a frozen reader LLM."
     )
-    p.add_argument("--input_file", type=str, required=True)
+    p.add_argument("--input_file", type=str, default=None,
+                   help="JSONL evaluation set. Required unless --smoke_test_only.")
     p.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "evaluation" / "outputs_downstream"))
     p.add_argument("--encoder_dir", type=str, default=None,
                    help="Path to a trained context-aware encoder checkpoint.")
@@ -325,6 +351,24 @@ def parse_args() -> argparse.Namespace:
                         "Cannot produce EM/F1 and must not be used for headline claims.")
     p.add_argument("--smoke_test_only", action="store_true",
                    help="Verify reader credentials and model id, then exit.")
+    # ---- DAC token-salience signal (audit findings D1-D8) ----
+    p.add_argument("--disable_dac", action="store_true",
+                   help="Turn the DAC salience signal off deliberately (ablation arm). "
+                        "Recorded as 'deliberately_disabled', distinct from a load failure.")
+    p.add_argument("--dac_salience_model", type=str, default=None,
+                   help="Masked-LM providing token information content, e.g. roberta-base. "
+                        "MUST publish trained MLM head weights; a bare AutoModel "
+                        "checkpoint is rejected because its head would be random.")
+    p.add_argument("--dac_fusion", type=str, default="additive",
+                   choices=["additive", "multiplicative"])
+    p.add_argument("--dac_alpha", type=float, default=0.8,
+                   help="Weight on question-attention in additive fusion; (1-alpha) on MLM loss.")
+    p.add_argument("--dac_require_attention", action="store_true",
+                   help="Fail instead of renormalising onto the MLM term when "
+                        "question-attention is unavailable.")
+    p.add_argument("--dac_strict", action="store_true",
+                   help="Raise if the DAC salience model cannot be loaded, instead of "
+                        "printing a warning and continuing without it.")
     return p.parse_args()
 
 
@@ -336,6 +380,20 @@ def main() -> None:
     unknown = [m for m in methods if m not in COMPRESSORS]
     if unknown:
         raise SystemExit(f"unknown methods: {unknown}. available: {sorted(COMPRESSORS)}")
+
+    # --smoke_test_only exits before any data is read, so --input_file is only
+    # required for a real run. Validated here rather than by argparse so that
+    # `--smoke_test_only` alone is a legal invocation.
+    if args.smoke_test_only and args.no_reader:
+        raise SystemExit(
+            "--smoke_test_only and --no_reader are contradictory: the smoke test "
+            "exists precisely to check that the reader is reachable."
+        )
+    if not args.smoke_test_only and not args.input_file:
+        raise SystemExit(
+            "--input_file is required for an evaluation run "
+            "(omit it only when passing --smoke_test_only)."
+        )
 
     # ---- Reader first: fail in seconds, not hours. ----
     reader = None
@@ -446,6 +504,7 @@ def main() -> None:
         extra={
             "reader": reader.config.public_dict() if reader else None,
             "reader_stats": reader.stats.to_dict() if reader else None,
+            "dac": dac_provenance(ctx),
             "metric_semantics": {
                 "em/f1/rouge_l": "genuine downstream reader accuracy",
                 "evidence_recall": "gold evidence retention in compressed context",

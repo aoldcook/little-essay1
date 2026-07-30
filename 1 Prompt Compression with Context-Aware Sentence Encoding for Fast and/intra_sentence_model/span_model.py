@@ -37,7 +37,13 @@ class SpanModelSchemaError(RuntimeError):
     """Raised when a checkpoint's feature schema does not match the current code."""
 
 
-def build_metadata(config: SpanClassifierConfig, feature_order: List[str], threshold: float) -> Dict:
+def build_metadata(
+    config: SpanClassifierConfig,
+    feature_order: List[str],
+    threshold: float,
+    dac_active: bool | None = None,
+    dac_salience_model: str | None = None,
+) -> Dict:
     from intra_sentence_model.span_feature_utils import FEATURE_SCHEMA_VERSION
 
     return {
@@ -47,10 +53,19 @@ def build_metadata(config: SpanClassifierConfig, feature_order: List[str], thres
         "feature_order": feature_order,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "threshold": threshold,
+        # `dac_score` is a model input whose DISTRIBUTION depends on whether the
+        # DAC salience model was live when the training features were generated.
+        # Recorded so the loader can refuse a DAC-off model at DAC-on inference.
+        "dac_active": dac_active,
+        "dac_salience_model": dac_salience_model,
     }
 
 
-def load_span_model(model_dir: str | Path, device: str | torch.device) -> Tuple[SpanClassifierMLP, Dict]:
+def load_span_model(
+    model_dir: str | Path,
+    device: str | torch.device,
+    runtime_dac_active: bool | None = None,
+) -> Tuple[SpanClassifierMLP, Dict]:
     """Load a span classifier, refusing any checkpoint whose features misalign.
 
     Without this check a checkpoint trained under an older FEATURE_ORDER loads
@@ -88,6 +103,29 @@ def load_span_model(model_dir: str | Path, device: str | torch.device) -> Tuple[
             f"Span model input_dim={metadata['input_dim']} but the current feature "
             f"vector has {expected_dim} dimensions. Retrain the span model."
         )
+
+    # `dac_score` is feature index 20. A model trained while DAC was disabled saw
+    # that column as a constant 0.0, so its learned weight for it is meaningless
+    # once real salience values start arriving -- the same train/inference
+    # distribution mismatch as the oracle features (finding C5), reached by a
+    # different route. Refuse the combination rather than degrade quietly.
+    if runtime_dac_active is not None:
+        ckpt_dac = metadata.get("dac_active")
+        if ckpt_dac is None and runtime_dac_active:
+            raise SpanModelSchemaError(
+                f"Span model at {model_dir} records no 'dac_active' flag, so it predates "
+                "DAC being functional and was trained with dac_score == 0.0 throughout. "
+                "Running it with DAC enabled feeds a feature distribution it never saw.\n\n"
+                "Either retrain with DAC enabled, or pass --disable_dac to reproduce the "
+                "conditions this checkpoint was trained under."
+            )
+        if ckpt_dac is not None and bool(ckpt_dac) != bool(runtime_dac_active):
+            raise SpanModelSchemaError(
+                f"Span model at {model_dir} was trained with dac_active={bool(ckpt_dac)} "
+                f"but inference is running with dac_active={bool(runtime_dac_active)}. "
+                "The dac_score feature would be out of distribution. Match the training "
+                "configuration, or retrain."
+            )
 
     config = SpanClassifierConfig(
         input_dim=int(metadata["input_dim"]),
