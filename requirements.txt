@@ -1,14 +1,25 @@
 # Pinned dependencies for reproducible runs (EVAL_VALIDITY_AUDIT.md finding M2).
 # Install with:  pip install -r requirements.txt
 #
-# torch is intentionally pinned loosely on the minor version because the correct
-# build depends on the host CUDA version. Record the resolved version via
-# `python -m repro.manifest` -- the manifest captures exact installed versions.
+# torch is pinned loosely on the minor version because the correct build depends
+# on the host CUDA version. Record exact resolved versions with:
+#     python -m repro.manifest
+#
+# Verified working set (AutoDL RTX 4090, Ubuntu 22.04, Python 3.12.3, CUDA 12.8):
+#     torch 2.8.0+cu128 · transformers 5.14.1 · numpy 2.3.2
+#     datasets 5.0.1 · openai 2.50.0 · scikit-learn 1.9.0
 
-torch>=2.2,<2.9
-transformers>=4.40,<5.0
+torch>=2.2,<3.0
+# transformers 5.x is import-compatible with this codebase and is what the
+# verified set above uses. Anything <4.40 is untested.
+transformers>=4.40,<6.0
 numpy>=1.24,<3.0
 scikit-learn>=1.3,<2.0
+
+# Required by data_builder/* to pull CQR / HotpotQA / LongBench / WikiText.
+# NOTE: on hosts where huggingface.co is unreachable, set
+#     export HF_ENDPOINT=https://hf-mirror.com
+datasets>=2.18,<6.0
 
 # Downstream reader LLM (Alibaba Bailian / DashScope OpenAI-compatible endpoint)
 openai>=1.30,<3.0
