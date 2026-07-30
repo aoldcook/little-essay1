@@ -43,6 +43,8 @@ def build_metadata(
     threshold: float,
     dac_active: bool | None = None,
     dac_salience_model: str | None = None,
+    label_policy: str | None = None,
+    label_reader_model: str | None = None,
 ) -> Dict:
     from intra_sentence_model.span_feature_utils import FEATURE_SCHEMA_VERSION
 
@@ -58,6 +60,13 @@ def build_metadata(
         # Recorded so the loader can refuse a DAC-off model at DAC-on inference.
         "dac_active": dac_active,
         "dac_salience_model": dac_salience_model,
+        # Which supervision this model was fit to. A model trained on
+        # rule-derived labels predicts a hand-written formula; one trained on
+        # reader-measured labels predicts downstream answerability. Reporting
+        # either as "the learned span model" without saying which is misleading,
+        # so the distinction is stamped into the checkpoint.
+        "label_policy": label_policy,
+        "label_reader_model": label_reader_model,
     }
 
 

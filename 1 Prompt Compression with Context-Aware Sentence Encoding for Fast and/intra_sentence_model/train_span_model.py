@@ -100,6 +100,24 @@ def main() -> None:
             "Regenerate pseudo-labels under a single DAC configuration."
         )
     dac_active = next(iter(dac_flags)) if dac_flags else None
+
+    label_policies = {str(r.get("label_policy")) for r in rows if r.get("label_policy")}
+    if len(label_policies) > 1:
+        raise SystemExit(
+            f"Training file mixes label policies {sorted(label_policies)}. The target "
+            "would mean different things on different rows. Regenerate under one policy."
+        )
+    label_policy = next(iter(label_policies)) if label_policies else None
+    reader_models = {str(r.get("label_reader_model")) for r in rows if r.get("label_reader_model")}
+    label_reader_model = next(iter(reader_models)) if len(reader_models) == 1 else None
+    print(f"label_policy={label_policy} label_reader_model={label_reader_model}")
+    if label_policy in {"heuristic", "feedback"}:
+        print(
+            "\n*** WARNING: this policy derives the label from a weighted sum over the "
+            "SAME features the model receives as input, so a high dev accuracy means "
+            "the model rediscovered that formula, not that it learned anything. Use "
+            "--label_policy reader for a target the model cannot see. ***\n"
+        )
     dac_models = {
         str(r.get("dac_salience_model")) for r in rows if r.get("dac_salience_model")
     }
@@ -265,6 +283,8 @@ def main() -> None:
                 threshold=0.5,
                 dac_active=dac_active,
                 dac_salience_model=dac_salience_model,
+                label_policy=label_policy,
+                label_reader_model=label_reader_model,
             ),
             f,
             ensure_ascii=False,
