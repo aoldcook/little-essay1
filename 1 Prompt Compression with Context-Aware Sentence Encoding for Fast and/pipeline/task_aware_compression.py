@@ -1060,14 +1060,33 @@ class DynamicSpanCompressor:
         """
         if not spans:
             return []
-        if sentence is None:
-            self.dac_offset_mismatch = True
+
+        # If DAC is not loaded the feature is genuinely absent: zeros are honest,
+        # and dac_active=False is what gets recorded downstream. But if DAC IS
+        # loaded and the caller withheld the sentence, that is a programming
+        # error. Returning zeros there would be silently catastrophic: they
+        # normalise to a CONSTANT 0.5 (normalize_scores maps a degenerate range
+        # to 0.5), so the model input looks populated, nothing warns, and the
+        # checkpoint still records dac_active=True. Fail loudly instead.
+        if not getattr(self.dac_adapter, "available", False):
             return [0.0 for _ in spans]
+
+        if sentence is None:
+            raise ValueError(
+                "compute_dac_span_scores requires the original sentence when DAC is "
+                "active: span .start/.end index that exact string. Pass sentence=..., "
+                "or construct the compressor with enable_dac=False."
+            )
 
         for span in spans:
             if sentence[span.start:span.end] != span.text:
                 self.dac_offset_mismatch = True
-                return [0.0 for _ in spans]
+                raise ValueError(
+                    "span offsets do not describe the supplied sentence "
+                    f"(span {span.start}:{span.end} is {sentence[span.start:span.end]!r} "
+                    f"but span.text is {span.text!r}). Scoring would attribute salience "
+                    "to the wrong tokens (finding D8)."
+                )
 
         self.dac_offset_mismatch = False
         dac_scores = self.dac_adapter.score_spans(question, sentence, spans)

@@ -405,7 +405,11 @@ def main() -> None:
                     continue
 
                 attention_scores = normalize_scores(compressor.compute_span_attention_scores(question, spans))
-                dac_scores = normalize_scores(compressor.compute_dac_span_scores(question, spans))
+                # `spans` carry offsets into `sentence`; it must be passed through or
+                # the salience scores get attributed to the wrong tokens (finding D8).
+                dac_scores = normalize_scores(
+                    compressor.compute_dac_span_scores(question, spans, sentence=sentence)
+                )
                 if not attention_scores:
                     attention_scores = [0.0 for _ in spans]
                 if not dac_scores:

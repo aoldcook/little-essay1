@@ -114,6 +114,27 @@ def main() -> None:
     else:
         print(f"dac_active={dac_active} dac_salience_model={dac_salience_model}")
 
+    # A file can claim dac_active=True while the dac_score column is constant --
+    # e.g. if the generator dropped the sentence argument, so every span scored
+    # 0.0 and normalisation mapped the degenerate range to a uniform 0.5. That
+    # trains a dead input while the checkpoint advertises a live DAC signal.
+    if dac_active:
+        dac_values = {
+            round(float(span["features"]["dac_score"]), 6)
+            for row in rows
+            for span in row.get("spans", [])
+            if "dac_score" in span.get("features", {})
+        }
+        if len(dac_values) <= 1:
+            raise SystemExit(
+                f"dac_active=True but dac_score takes only {len(dac_values)} distinct "
+                f"value(s) {sorted(dac_values)[:3]} across the whole file, i.e. it is a "
+                "constant column carrying no information.\n\n"
+                "This usually means pseudo-label generation called "
+                "compute_dac_span_scores without the sentence argument. Regenerate the "
+                "pseudo-labels, or train with DAC genuinely disabled."
+            )
+
     if args.split_mode == "group":
         X_train, y_train, X_dev, y_dev, split_stats = build_xy_group_disjoint(
             rows, args.dev_ratio, seed=args.seed
