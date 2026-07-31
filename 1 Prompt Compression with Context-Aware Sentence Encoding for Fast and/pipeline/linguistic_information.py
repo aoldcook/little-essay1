@@ -392,15 +392,32 @@ def information_density_score(sentence: str, key_terms: Set[str]) -> float:
     return _clip01(raw / 1.55)
 
 
-def redundancy_marginal_gain_score(sentence: str, index: int, sentences: Sequence[str], key_terms: Set[str]) -> float:
-    terms = set(tokenize(sentence))
+def redundancy_marginal_gain_score(
+    sentence: str,
+    index: int,
+    sentences: Sequence[str],
+    key_terms: Set[str],
+    token_sets: Optional[Sequence[Set[str]]] = None,
+) -> float:
+    """Marginal gain of this sentence against every other sentence.
+
+    `token_sets` must be the pre-tokenised sentences. Without it this
+    re-tokenises every other sentence for every sentence, i.e. O(N^2) regex
+    tokenisations per context -- ~10k for a 100-sentence context, which made
+    Stage 1 CPU-bound at roughly one core with the GPU idle. Passing the cached
+    sets makes it O(N) tokenisations and O(N^2) cheap set intersections.
+    """
+    if token_sets is not None:
+        terms = token_sets[index]
+    else:
+        terms = set(tokenize(sentence))
     if not terms:
         return 0.0
     max_overlap = 0.0
     for other_idx, other in enumerate(sentences):
         if other_idx == index:
             continue
-        other_terms = set(tokenize(other))
+        other_terms = token_sets[other_idx] if token_sets is not None else set(tokenize(other))
         if not other_terms:
             continue
         max_overlap = max(max_overlap, len(terms & other_terms) / max(len(terms | other_terms), 1))
@@ -410,21 +427,32 @@ def redundancy_marginal_gain_score(sentence: str, index: int, sentences: Sequenc
     return _clip01(0.65 * unique_ratio + 0.25 * key_bonus + consequence_bonus)
 
 
-def inter_sentence_dependency_score(sentence: str, index: int, sentences: Sequence[str], cues: Sequence[DiscourseCue]) -> float:
+def inter_sentence_dependency_score(
+    sentence: str,
+    index: int,
+    sentences: Sequence[str],
+    cues: Sequence[DiscourseCue],
+    token_sets: Optional[Sequence[Set[str]]] = None,
+) -> float:
     lowered = sentence.lower()
     score = 0.0
     if any(cue.cue_type in {"causality", "contrast", "condition", "temporal"} for cue in cues):
         score += 0.25
     if index > 0 and any(re.search(rf"\b{re.escape(pattern)}\b", lowered) for pattern in PRONOUN_PATTERNS):
         score += 0.18
+
+    def terms_at(idx: int) -> Set[str]:
+        if token_sets is not None:
+            return token_sets[idx]
+        return set(tokenize(sentences[idx]))
+
+    this_terms = terms_at(index)
     if index + 1 < len(sentences):
-        next_terms = set(tokenize(sentences[index + 1]))
-        this_terms = set(tokenize(sentence))
+        next_terms = terms_at(index + 1)
         if this_terms and len(this_terms & next_terms) / max(len(next_terms), 1) >= 0.25:
             score += 0.18
     if index > 0:
-        prev_terms = set(tokenize(sentences[index - 1]))
-        this_terms = set(tokenize(sentence))
+        prev_terms = terms_at(index - 1)
         if this_terms and len(this_terms & prev_terms) / max(len(this_terms), 1) >= 0.25:
             score += 0.12
     if re.search(r"\b(these|this|therefore|however|such)\b", lowered):
@@ -463,6 +491,9 @@ def build_linguistic_sentence_features(
             question_type = "other"
     key_terms = descriptor_key_terms(descriptor) | set(tokenize(question))
     all_entities = [extract_entities_lightweight(sentence) for sentence in sentences]
+    # Tokenise each sentence exactly once; the pairwise scores below are O(N^2)
+    # in comparisons but must not be O(N^2) in tokenisations.
+    token_sets = [set(tokenize(sentence)) for sentence in sentences]
 
     features: List[SentenceLinguisticFeatures] = []
     for idx, sentence in enumerate(sentences):
@@ -470,8 +501,12 @@ def build_linguistic_sentence_features(
         coref_score = coreference_preservation_score(sentence, idx, all_entities, key_terms, sentences)
         predicate_score, units = predicate_argument_score(sentence, question_type, key_terms)
         density_score = information_density_score(sentence, key_terms)
-        redundancy_score = redundancy_marginal_gain_score(sentence, idx, sentences, key_terms)
-        dependency_score = inter_sentence_dependency_score(sentence, idx, sentences, cues)
+        redundancy_score = redundancy_marginal_gain_score(
+            sentence, idx, sentences, key_terms, token_sets=token_sets
+        )
+        dependency_score = inter_sentence_dependency_score(
+            sentence, idx, sentences, cues, token_sets=token_sets
+        )
         position_score = position_utility_score(idx, len(sentences))
 
         weighted_parts = []

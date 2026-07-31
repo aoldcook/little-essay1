@@ -32,6 +32,16 @@ class ContextAwareEncoderConfig:
     trust_remote_code: bool = True
     pooling_strategy: str = "last_token"
     query_instruction: str = DEFAULT_QUERY_INSTRUCTION
+    # Sentences of one context were previously encoded in a SINGLE batch, so a
+    # context with N sentences allocated N x heads x max_length^2 attention
+    # weights under eager attention. A 100-sentence context at max_length 1024
+    # exhausts a 24 GB card. Encoding is chunked to this size instead; it changes
+    # throughput only, never the resulting embeddings.
+    # 64 rather than 16: marked context WINDOWS are ~900 chars (~250 tokens), not
+    # the full max_length, so attention here costs ~16x less than the worst case.
+    # At 16 the GPU sat at 17% utilisation and a single 1013-row cell had not
+    # finished after 95 minutes -- the run was launch-bound on tiny batches.
+    encode_batch_size: int = 64
 
 
 class ContextAwareSentenceEncoder(nn.Module):
@@ -140,6 +150,30 @@ class ContextAwareSentenceEncoder(nn.Module):
         questions: Sequence[str],
         marked_contexts: Sequence[str],
     ) -> torch.Tensor:
+        """Encode marked contexts in fixed-size chunks.
+
+        Chunking is required, not an optimisation: encoding every sentence of a
+        long context at once allocates batch x heads x len^2 attention weights
+        and OOMs a 24 GB GPU on realistic inputs.
+        """
+        batch_size = max(1, int(getattr(self.config, "encode_batch_size", 16)))
+        if len(marked_contexts) <= batch_size:
+            return self._encode_marked_chunk(questions, marked_contexts)
+
+        chunks = [
+            self._encode_marked_chunk(
+                questions[start: start + batch_size],
+                marked_contexts[start: start + batch_size],
+            )
+            for start in range(0, len(marked_contexts), batch_size)
+        ]
+        return torch.cat(chunks, dim=0)
+
+    def _encode_marked_chunk(
+        self,
+        questions: Sequence[str],
+        marked_contexts: Sequence[str],
+    ) -> torch.Tensor:
         encoded_questions = [self.format_query(question) for question in questions]
         batch = self.tokenizer(
             encoded_questions,
@@ -198,6 +232,21 @@ class ContextAwareSentenceEncoder(nn.Module):
             return []
 
         self.eval()
+        # Same OOM hazard as encode_marked_contexts, and worse: output_attentions
+        # materialises layers x heads x len^2 per item.
+        batch_size = max(1, int(getattr(self.config, "encode_batch_size", 16)))
+        if len(marked_contexts) > batch_size:
+            scores: List[float] = []
+            for start in range(0, len(marked_contexts), batch_size):
+                scores.extend(
+                    self.attention_probe_scores(
+                        question,
+                        marked_contexts[start: start + batch_size],
+                        probe_layers=probe_layers,
+                    )
+                )
+            return scores
+
         encoded_question = self.format_query(question)
         batch = self.tokenizer(
             [encoded_question] * len(marked_contexts),

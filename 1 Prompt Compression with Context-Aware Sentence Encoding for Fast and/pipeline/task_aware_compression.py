@@ -493,13 +493,17 @@ class DynamicSpanCompressor:
             relevance_scores.append(0.50 * base_score + 0.25 * overlap + 0.25 * anchor)
 
         mig_scores = []
+        # Tokenise once per sentence, not once per PAIR: this loop is O(N^2) in
+        # comparisons and was O(N^2) in regex tokenisations, which made Stage 1
+        # CPU-bound on long contexts.
+        term_sets = [set(tokenize_query_terms(sentence)) for sentence in sentences]
         for idx, sentence in enumerate(sentences):
-            sentence_terms = set(tokenize_query_terms(sentence))
+            sentence_terms = term_sets[idx]
             redundancy = 0.0
             for other_idx, other_sentence in enumerate(sentences):
                 if idx == other_idx:
                     continue
-                other_terms = set(tokenize_query_terms(other_sentence))
+                other_terms = term_sets[other_idx]
                 if not sentence_terms or not other_terms:
                     continue
                 overlap = len(sentence_terms & other_terms) / max(len(sentence_terms | other_terms), 1)

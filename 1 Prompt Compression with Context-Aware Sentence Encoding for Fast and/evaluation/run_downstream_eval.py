@@ -566,6 +566,18 @@ def main() -> None:
                 res = evaluate_method(method, ratio, rows, reader, ctx)
                 res["seed"] = seed
                 results.append(res)
+            if method == "dac" and ctx.get("dac_baseline") is not None:
+                # Release the baseline's causal LM before the ours_* methods run.
+                # Two ~0.5B models plus eager attention over long contexts does
+                # not fit on a 24 GB card.
+                ctx.pop("dac_baseline", None)
+                import gc
+
+                import torch as _torch
+
+                gc.collect()
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
                 s = res["summary"]
                 print(
                     f"seed={seed} method={method:>16} ratio={ratio} "
