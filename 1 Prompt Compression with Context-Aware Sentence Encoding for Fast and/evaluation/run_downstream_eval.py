@@ -566,6 +566,15 @@ def main() -> None:
                 res = evaluate_method(method, ratio, rows, reader, ctx)
                 res["seed"] = seed
                 results.append(res)
+                s = res["summary"]
+                print(
+                    f"seed={seed} method={method:>16} ratio={ratio} "
+                    f"achieved={_fmt(s['achieved_ratio'])} x={_fmt(s['compression_x'])} "
+                    f"EM={_fmt(s['em'])} F1={_fmt(s['f1'])} "
+                    f"evid={_fmt(s['evidence_recall'])} "
+                    f"scored={res['scored_rows']} reader_fail={res['reader_failures']}",
+                    flush=True,
+                )
             if method == "dac" and ctx.get("dac_baseline") is not None:
                 # Release the baseline's causal LM before the ours_* methods run.
                 # Two ~0.5B models plus eager attention over long contexts does
@@ -578,15 +587,6 @@ def main() -> None:
                 gc.collect()
                 if _torch.cuda.is_available():
                     _torch.cuda.empty_cache()
-                s = res["summary"]
-                print(
-                    f"seed={seed} method={method:>16} ratio={ratio} "
-                    f"achieved={_fmt(s['achieved_ratio'])} x={_fmt(s['compression_x'])} "
-                    f"EM={_fmt(s['em'])} F1={_fmt(s['f1'])} "
-                    f"evid={_fmt(s['evidence_recall'])} "
-                    f"scored={res['scored_rows']} reader_fail={res['reader_failures']}",
-                    flush=True,
-                )
 
     # ---- Multi-seed aggregation (finding M1) ----
     grouped: Dict[str, List[Dict[str, object]]] = {}
