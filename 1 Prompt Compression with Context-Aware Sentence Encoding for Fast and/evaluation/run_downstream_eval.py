@@ -289,6 +289,10 @@ def evaluate_method(
     fn = COMPRESSORS[method]
     per_row: List[Dict[str, object]] = []
 
+    # Phase 1: compress everything. Compression latency is measured per row here,
+    # where it is a property of the method; reader latency is a property of the
+    # API and is reported in aggregate below rather than per row.
+    pending: List[Dict[str, object]] = []
     for row in rows:
         question = " ".join(str(row.get("question") or "").split())
         context = " ".join(str(row.get("context") or "").split())
@@ -316,27 +320,68 @@ def evaluate_method(
             "evidence_recall": evidence_recall(gold_evidence(row), compressed),
             "has_reference": bool(refs),
         }
-
-        if reader is not None and refs:
-            out = reader.answer(question=question, context=compressed)
-            record["prediction"] = out["answer"]
-            record["reader_ok"] = out["ok"]
-            record["reader_error"] = out["error"]
-            record["reader_latency_s"] = out["latency_s"]
-            record["reader_prompt_tokens"] = out.get("prompt_tokens")
-            record.update(score_prediction(str(out["answer"]), refs))
         per_row.append(record)
+        pending.append({"record": record, "question": question,
+                        "compressed": compressed, "refs": refs})
+
+    # Phase 2: one batched, cached, concurrent pass over the reader. Serially this
+    # was ~1013 calls per method-ratio cell at ~0.6 s each, i.e. hours per seed.
+    # The reader is deterministic at temperature 0, so batching changes nothing
+    # about the results.
+    batch_reader = ctx.get("batch_reader")
+    if reader is not None and batch_reader is not None:
+        scored = [item for item in pending if item["refs"]]
+        if scored:
+            t0 = time.monotonic()
+            answers = batch_reader.answer_many(
+                [(item["question"], item["compressed"]) for item in scored]
+            )
+            reader_wall = time.monotonic() - t0
+            for item, answer in zip(scored, answers):
+                record = item["record"]
+                record["prediction"] = answer
+                ok = bool(str(answer).strip())
+                record["reader_ok"] = ok
+                if ok:
+                    record.update(score_prediction(str(answer), item["refs"]))
+                else:
+                    # An empty answer means the API call failed after retries.
+                    # Scoring it as a wrong answer would silently depress this
+                    # method's numbers in proportion to how flaky the network
+                    # was. Leave the metrics None so aggregate() skips the row,
+                    # and surface the count instead.
+                    record["em"] = record["f1"] = record["rouge_l"] = None
+            for record in (item["record"] for item in scored):
+                record["reader_batch_wall_s"] = reader_wall / max(len(scored), 1)
 
     metric_keys = [
         "em", "f1", "rouge_l", "evidence_recall", "achieved_ratio",
-        "compression_x", "compress_latency_s", "reader_latency_s",
+        "compression_x", "compress_latency_s", "reader_batch_wall_s",
         "reader_prompt_tokens", "compressed_tokens",
     ]
+    # Per-dataset breakdown is mandatory, not optional. This pool mixes extractive
+    # QA (HotpotQA, 2wikimqa: median gold 2 words) with sentence-response tasks
+    # (cqr_official, wikitext103_pseudo_cqr: median gold ~20 words) while the
+    # reader prompt asks for a short span. A pooled EM/F1 averages a task the
+    # setup fits with one it structurally cannot score, and means nothing.
+    datasets = sorted({str(r.get("dataset")) for r in per_row})
+    by_dataset = {
+        name: {
+            "num_rows": sum(1 for r in per_row if str(r.get("dataset")) == name),
+            **aggregate([r for r in per_row if str(r.get("dataset")) == name], metric_keys),
+        }
+        for name in datasets
+    }
+
+    reader_failures = sum(1 for r in per_row if r.get("reader_ok") is False)
     return {
         "method": method,
         "requested_ratio": ratio,
         "num_rows": len(per_row),
+        "reader_failures": reader_failures,
+        "scored_rows": sum(1 for r in per_row if r.get("f1") is not None),
         "summary": aggregate(per_row, metric_keys),
+        "by_dataset": by_dataset,
         "rows": per_row,
     }
 
@@ -369,6 +414,12 @@ def parse_args() -> argparse.Namespace:
                         "Cannot produce EM/F1 and must not be used for headline claims.")
     p.add_argument("--smoke_test_only", action="store_true",
                    help="Verify reader credentials and model id, then exit.")
+    p.add_argument("--reader_concurrency", type=int, default=16,
+                   help="Parallel reader calls. The reader is deterministic at "
+                        "temperature 0, so this changes throughput, not results.")
+    p.add_argument("--reader_cache", type=str, default="",
+                   help="JSONL cache of reader answers. Defaults to <output_dir>/reader_cache.jsonl. "
+                        "Lets a re-run or an added seed reuse identical calls.")
     # ---- DAC token-salience signal (audit findings D1-D8) ----
     p.add_argument("--disable_dac", action="store_true",
                    help="Turn the DAC salience signal off deliberately (ablation arm). "
@@ -477,6 +528,15 @@ def main() -> None:
                 "reported only as an ablation baseline. ***\n"
             )
 
+    if reader is not None:
+        from evaluation.cached_reader import CachedBatchReader
+
+        cache_path = args.reader_cache or str(Path(args.output_dir) / "reader_cache.jsonl")
+        ctx["batch_reader"] = CachedBatchReader(
+            reader, cache_path=cache_path, concurrency=args.reader_concurrency
+        )
+        print("reader_batching:", json.dumps(ctx["batch_reader"].provenance(), ensure_ascii=False))
+
     if "dac" in methods:
         from pipeline.dac_baseline import DacBaselineCompressor, DacBaselineConfig
 
@@ -511,7 +571,8 @@ def main() -> None:
                     f"seed={seed} method={method:>16} ratio={ratio} "
                     f"achieved={_fmt(s['achieved_ratio'])} x={_fmt(s['compression_x'])} "
                     f"EM={_fmt(s['em'])} F1={_fmt(s['f1'])} "
-                    f"evid={_fmt(s['evidence_recall'])}",
+                    f"evid={_fmt(s['evidence_recall'])} "
+                    f"scored={res['scored_rows']} reader_fail={res['reader_failures']}",
                     flush=True,
                 )
 
