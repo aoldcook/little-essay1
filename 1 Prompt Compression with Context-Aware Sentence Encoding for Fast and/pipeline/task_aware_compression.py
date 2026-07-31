@@ -444,10 +444,8 @@ class DynamicSpanCompressor:
             )
             feature_rows.append(features_to_vector(feature_dict))
 
-        x = torch.tensor(feature_rows, dtype=torch.float32, device=self.device)
-        with torch.no_grad():
-            logits = self.learned_span_model(x)
-            probs = torch.sigmoid(logits).detach().cpu().tolist()
+        # Uniform interface: the checkpoint may hold an MLP or a GBM.
+        probs = self.learned_span_model.predict_scores(np.asarray(feature_rows, dtype=np.float32))
         return [float(p) for p in probs]
 
     def compress_sentences(

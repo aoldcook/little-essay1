@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import json
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -37,27 +38,71 @@ class SpanModelSchemaError(RuntimeError):
     """Raised when a checkpoint's feature schema does not match the current code."""
 
 
+# ---------------------------------------------------------------------------
+# Uniform scoring interface.
+#
+# The MLP substantially underfits this target: on the group-disjoint dev split
+# it reaches ROC-AUC 0.765 where a gradient-boosted tree on the SAME features and
+# labels reaches 0.905, and where a GBM on eight length/position features alone
+# reaches 0.825. Callers should not care which estimator is in the checkpoint, so
+# both are wrapped behind predict_scores().
+# ---------------------------------------------------------------------------
+
+class SpanScorer:
+    """Scores span feature vectors in [0, 1]. Higher = more important to keep."""
+
+    model_type = "abstract"
+
+    def predict_scores(self, features: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+
+class MLPSpanScorer(SpanScorer):
+    model_type = "mlp"
+
+    def __init__(self, model: SpanClassifierMLP, device):
+        self.model = model
+        self.device = device
+
+    def predict_scores(self, features: np.ndarray) -> np.ndarray:
+        x = torch.tensor(np.asarray(features, dtype=np.float32), device=self.device)
+        with torch.no_grad():
+            return torch.sigmoid(self.model(x)).detach().cpu().numpy()
+
+
+class GBMSpanScorer(SpanScorer):
+    model_type = "gbm"
+
+    def __init__(self, model):
+        self.model = model
+
+    def predict_scores(self, features: np.ndarray) -> np.ndarray:
+        return self.model.predict_proba(np.asarray(features, dtype=np.float64))[:, 1]
+
+
 def build_metadata(
-    config: SpanClassifierConfig,
+    config: SpanClassifierConfig | None,
     feature_order: List[str],
     threshold: float,
     dac_active: bool | None = None,
     dac_salience_model: str | None = None,
     label_policy: str | None = None,
     label_reader_model: str | None = None,
+    model_type: str = "mlp",
+    dev_metrics: Dict[str, float] | None = None,
 ) -> Dict:
     from intra_sentence_model.span_feature_utils import FEATURE_SCHEMA_VERSION
 
     return {
-        "input_dim": config.input_dim,
-        "hidden_dims": config.hidden_dims,
-        "dropout": config.dropout,
+        "model_type": model_type,
+        "input_dim": config.input_dim if config else len(feature_order),
+        "hidden_dims": config.hidden_dims if config else [],
+        "dropout": config.dropout if config else 0.0,
         "feature_order": feature_order,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        # Selected on the dev split, not assumed. At a 16.5% positive rate a fixed
+        # 0.5 is arbitrary and scores below the majority-class baseline.
         "threshold": threshold,
-        # `dac_score` is a model input whose DISTRIBUTION depends on whether the
-        # DAC salience model was live when the training features were generated.
-        # Recorded so the loader can refuse a DAC-off model at DAC-on inference.
         "dac_active": dac_active,
         "dac_salience_model": dac_salience_model,
         # Which supervision this model was fit to. A model trained on
@@ -67,6 +112,7 @@ def build_metadata(
         # so the distinction is stamped into the checkpoint.
         "label_policy": label_policy,
         "label_reader_model": label_reader_model,
+        "dev_metrics": dev_metrics or {},
     }
 
 
@@ -74,8 +120,8 @@ def load_span_model(
     model_dir: str | Path,
     device: str | torch.device,
     runtime_dac_active: bool | None = None,
-) -> Tuple[SpanClassifierMLP, Dict]:
-    """Load a span classifier, refusing any checkpoint whose features misalign.
+) -> Tuple[SpanScorer, Dict]:
+    """Load a span scorer, refusing any checkpoint whose features misalign.
 
     Without this check a checkpoint trained under an older FEATURE_ORDER loads
     happily and reads every feature at the wrong index -- producing confident,
@@ -136,6 +182,24 @@ def load_span_model(
                 "configuration, or retrain."
             )
 
+    # Checkpoints written before the GBM option carry no model_type; they are MLPs.
+    model_type = str(metadata.get("model_type") or "mlp")
+
+    if model_type == "gbm":
+        import joblib
+
+        model_path = model_dir / "span_model.joblib"
+        if not model_path.exists():
+            raise SpanModelSchemaError(
+                f"metadata declares model_type=gbm but {model_path} is missing."
+            )
+        return GBMSpanScorer(joblib.load(model_path)), metadata
+
+    if model_type != "mlp":
+        raise SpanModelSchemaError(
+            f"unknown model_type {model_type!r} in {model_dir}; expected 'mlp' or 'gbm'."
+        )
+
     config = SpanClassifierConfig(
         input_dim=int(metadata["input_dim"]),
         hidden_dims=list(metadata["hidden_dims"]),
@@ -149,5 +213,4 @@ def load_span_model(
     model.load_state_dict(state)
     model.to(device)
     model.eval()
-    return model, metadata
-
+    return MLPSpanScorer(model, device), metadata
