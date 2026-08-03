@@ -200,6 +200,128 @@ def select_with_budget_aware_beam(
     return [int(np.argmax(sims))]
 
 
+def cluster_sentences_greedy(
+    sentence_embeddings: torch.Tensor,
+    similarity_threshold: float = 0.55,
+    max_clusters: int = 6,
+) -> List[int]:
+    """Greedy agglomerative clustering of sentences by embedding similarity.
+
+    Multi-hop questions need supporting facts from several distinct passages,
+    and those facts are about DIFFERENT entities, so they land in different
+    clusters. Deliberately greedy and centroid-free (max-linkage against
+    members) to stay O(n * k) and avoid a scikit-learn dependency in the hot
+    path.
+    """
+    embs = sentence_embeddings.detach().cpu().numpy()
+    if embs.ndim != 2 or embs.shape[0] == 0:
+        return [0] * int(sentence_embeddings.shape[0]) if sentence_embeddings.ndim else []
+
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    embs = embs / np.clip(norms, 1e-9, None)
+
+    assignments = [-1] * embs.shape[0]
+    centroids: List[np.ndarray] = []
+    for idx in range(embs.shape[0]):
+        vector = embs[idx]
+        best_cluster, best_sim = -1, -1.0
+        for cluster_id, centroid in enumerate(centroids):
+            sim = float(np.dot(vector, centroid))
+            if sim > best_sim:
+                best_cluster, best_sim = cluster_id, sim
+        if best_cluster >= 0 and best_sim >= similarity_threshold:
+            assignments[idx] = best_cluster
+        elif len(centroids) < max_clusters:
+            centroids.append(vector.copy())
+            assignments[idx] = len(centroids) - 1
+        else:
+            assignments[idx] = max(best_cluster, 0)
+    return assignments
+
+
+def select_with_bridge_coverage(
+    similarities: List[float],
+    sentence_embeddings: torch.Tensor,
+    sentences: Sequence[str],
+    target_ratio: float,
+    lambda_relevance: float = 0.7,
+    beam_size: int = 64,
+    cluster_threshold: float = 0.55,
+    max_clusters: int = 6,
+    max_coverage_sentences: int = 3,
+) -> List[int]:
+    """Guarantee coverage of distinct evidence clusters before filling the budget.
+
+    Measured motivation: at 8x compression 31.6% of multi-hop examples retain
+    exactly ONE of two supporting facts, scoring F1 0.451 against 0.899 when
+    both survive. Relevance ranking concentrates budget on sentences that match
+    the question lexically and starves the bridge fact, which shares few surface
+    terms with it. MMR removes redundancy but never guarantees COVERAGE.
+
+    Phase 1 reserves the single best sentence from each of the top clusters.
+    Phase 2 runs the ordinary budget-aware beam over what remains. Unlike a
+    per-example ratio predictor -- which we measured to be unreachable, since a
+    0.69-AUC router underperforms a fixed ratio -- this is a structural
+    constraint and needs no per-example prediction.
+    """
+    if not sentences:
+        return []
+    sims = np.asarray(similarities, dtype=float)
+    if sims.size != len(sentences):
+        raise ValueError(f"len(similarities)={sims.size} but len(sentences)={len(sentences)}")
+
+    lengths = [estimate_token_count(sentence) for sentence in sentences]
+    budget = max(1, int(sum(lengths) * target_ratio))
+
+    assignments = cluster_sentences_greedy(
+        sentence_embeddings, similarity_threshold=cluster_threshold, max_clusters=max_clusters
+    )
+    if len(assignments) != len(sentences):
+        return select_with_budget_aware_beam(
+            similarities, sentence_embeddings, sentences, target_ratio,
+            lambda_relevance=lambda_relevance, beam_size=beam_size,
+        )
+
+    # Best sentence per cluster, clusters ordered by their best similarity.
+    best_per_cluster: Dict[int, int] = {}
+    for idx, cluster_id in enumerate(assignments):
+        current = best_per_cluster.get(cluster_id)
+        if current is None or sims[idx] > sims[current]:
+            best_per_cluster[cluster_id] = idx
+    ordered = sorted(best_per_cluster.values(), key=lambda i: float(sims[i]), reverse=True)
+
+    reserved: List[int] = []
+    used = 0
+    for idx in ordered[:max_coverage_sentences]:
+        if used + lengths[idx] > budget:
+            continue
+        reserved.append(idx)
+        used += lengths[idx]
+
+    if not reserved:
+        return select_with_budget_aware_beam(
+            similarities, sentence_embeddings, sentences, target_ratio,
+            lambda_relevance=lambda_relevance, beam_size=beam_size,
+        )
+
+    remaining_idx = [i for i in range(len(sentences)) if i not in set(reserved)]
+    remaining_budget = budget - used
+    if remaining_idx and remaining_budget > 0:
+        sub_total = sum(lengths[i] for i in remaining_idx)
+        sub_ratio = min(1.0, remaining_budget / max(sub_total, 1))
+        sub_pick = select_with_budget_aware_beam(
+            similarities=[similarities[i] for i in remaining_idx],
+            sentence_embeddings=sentence_embeddings[remaining_idx],
+            sentences=[sentences[i] for i in remaining_idx],
+            target_ratio=sub_ratio,
+            lambda_relevance=lambda_relevance,
+            beam_size=beam_size,
+        )
+        reserved.extend(remaining_idx[j] for j in sub_pick)
+
+    return sorted(set(reserved))
+
+
 def select_with_mmr(
     similarities: List[float],
     sentence_embeddings: torch.Tensor,
@@ -424,6 +546,10 @@ class ContextAwareCompressor:
         second_stage_max_keep_ratio: float = 0.76,
         span_model_dir: Optional[str] = None,
         allow_heuristic_fallback: bool = False,
+        bridge_coverage: bool = False,
+        bridge_cluster_threshold: float = 0.55,
+        bridge_max_clusters: int = 6,
+        bridge_coverage_sentences: int = 3,
         enable_dac: bool = True,
         dac_salience_backend: str = "causal",
         dac_salience_model: Optional[str] = None,
@@ -523,6 +649,14 @@ class ContextAwareCompressor:
                 enable_dac=enable_dac,
             )
 
+        # Evidence-cluster coverage: reserve budget for distinct evidence
+        # clusters so a multi-hop bridge fact is not starved by sentences that
+        # merely match the question lexically.
+        self.bridge_coverage = bool(bridge_coverage)
+        self.bridge_cluster_threshold = float(bridge_cluster_threshold)
+        self.bridge_max_clusters = int(bridge_max_clusters)
+        self.bridge_coverage_sentences = int(bridge_coverage_sentences)
+
         self.encoder_requested = str(encoder_dir)
         self.span_model_dir = span_model_dir
         self.budget_model_dir = budget_model_dir
@@ -580,6 +714,8 @@ class ContextAwareCompressor:
             "trust_remote_code",
             "pooling_strategy",
             "query_instruction",
+            "encode_batch_size",
+            "use_markers",
         }
         return {key: value for key, value in cfg_dict.items() if key in allowed_keys}
 
@@ -802,13 +938,25 @@ class ContextAwareCompressor:
         else:
             budget_formula = None
 
-        selected_idx = select_with_budget_aware_beam(
-            similarities=selection_scores,
-            sentence_embeddings=sent_embs,
-            sentences=sentences,
-            target_ratio=target_ratio,
-            lambda_relevance=lambda_relevance,
-        )
+        if self.bridge_coverage:
+            selected_idx = select_with_bridge_coverage(
+                similarities=selection_scores,
+                sentence_embeddings=sent_embs,
+                sentences=sentences,
+                target_ratio=target_ratio,
+                lambda_relevance=lambda_relevance,
+                cluster_threshold=self.bridge_cluster_threshold,
+                max_clusters=self.bridge_max_clusters,
+                max_coverage_sentences=self.bridge_coverage_sentences,
+            )
+        else:
+            selected_idx = select_with_budget_aware_beam(
+                similarities=selection_scores,
+                sentence_embeddings=sent_embs,
+                sentences=sentences,
+                target_ratio=target_ratio,
+                lambda_relevance=lambda_relevance,
+            )
 
         selected_sentences = [sentences[idx] for idx in selected_idx]
         selected_scores = [selection_scores[idx] for idx in selected_idx]

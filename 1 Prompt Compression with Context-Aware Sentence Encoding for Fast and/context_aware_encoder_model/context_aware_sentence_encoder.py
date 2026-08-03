@@ -42,6 +42,12 @@ class ContextAwareEncoderConfig:
     # At 16 the GPU sat at 17% utilisation and a single 1013-row cell had not
     # finished after 95 minutes -- the run was launch-bound on tiny batches.
     encode_batch_size: int = 64
+    # When False, sentences are embedded ALONE -- no marker tokens, no local
+    # context window, no question pairing -- and scored by plain cosine
+    # similarity to the question embedding. This is off-the-shelf dense
+    # retrieval, and it is the control that separates "our fine-tuning helped"
+    # from "the stock model was handicapped by marker tokens it never saw".
+    use_markers: bool = True
 
 
 class ContextAwareSentenceEncoder(nn.Module):
@@ -169,11 +175,37 @@ class ContextAwareSentenceEncoder(nn.Module):
         ]
         return torch.cat(chunks, dim=0)
 
+    def _span_text(self, marked_context: str) -> str:
+        """Recover the target sentence from a marked context window."""
+        start = marked_context.find(self.config.marker_start)
+        end = marked_context.find(self.config.marker_end)
+        if start == -1 or end == -1 or end <= start:
+            return marked_context.strip()
+        return marked_context[start + len(self.config.marker_start): end].strip()
+
     def _encode_marked_chunk(
         self,
         questions: Sequence[str],
         marked_contexts: Sequence[str],
     ) -> torch.Tensor:
+        if not self.config.use_markers:
+            # Plain dense retrieval: embed each sentence on its own, with no
+            # markers, no surrounding window and no question pairing.
+            texts = [self._span_text(marked) for marked in marked_contexts]
+            batch = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.config.max_length,
+                return_tensors="pt",
+            ).to(self.device)
+            outputs = self.encoder(**batch)
+            if self.config.pooling_strategy == "last_token":
+                pooled = self.last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
+            else:
+                pooled = self.mean_pool(outputs.last_hidden_state, batch["attention_mask"])
+            return F.normalize(pooled, p=2, dim=1)
+
         encoded_questions = [self.format_query(question) for question in questions]
         batch = self.tokenizer(
             encoded_questions,
