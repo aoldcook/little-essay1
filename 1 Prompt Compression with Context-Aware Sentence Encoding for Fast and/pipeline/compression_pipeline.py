@@ -546,6 +546,7 @@ class ContextAwareCompressor:
         second_stage_max_keep_ratio: float = 0.76,
         span_model_dir: Optional[str] = None,
         allow_heuristic_fallback: bool = False,
+        single_pass_scoring: bool = False,
         bridge_coverage: bool = False,
         bridge_cluster_threshold: float = 0.55,
         bridge_max_clusters: int = 6,
@@ -648,6 +649,10 @@ class ContextAwareCompressor:
                 dac_strict=dac_strict,
                 enable_dac=enable_dac,
             )
+
+        # Single-pass scoring: encode the context once and pool per-sentence
+        # token spans, instead of one windowed forward pass per sentence.
+        self.single_pass_scoring = bool(single_pass_scoring)
 
         # Evidence-cluster coverage: reserve budget for distinct evidence
         # clusters so a multi-hop bridge fact is not starved by sentences that
@@ -826,22 +831,41 @@ class ContextAwareCompressor:
         sentences = split_sentences(context)
         descriptor = build_task_descriptor(question) if self.use_task_descriptor else None
 
-        marked_contexts = [
-            build_marked_context_window(
-                sentences=sentences,
-                target_index=idx,
-                marker_start=self.encoder.config.marker_start,
-                marker_end=self.encoder.config.marker_end,
-                max_chars=self.window_max_chars,
+        if self.single_pass_scoring and sentences:
+            # One encoder pass over the whole context instead of one per
+            # sentence; sentence embeddings are mean-pooled token spans.
+            spans: List[Tuple[int, int]] = []
+            cursor = 0
+            for sentence in sentences:
+                found = context.find(sentence, cursor)
+                if found == -1:
+                    found = context.find(sentence)
+                if found == -1:
+                    spans.append((cursor, cursor))
+                else:
+                    spans.append((found, found + len(sentence)))
+                    cursor = found + len(sentence)
+            semantic_similarities, sent_embs = self.encoder.score_sentences_single_pass(
+                question=question, context=context, sentence_spans=spans
             )
-            for idx in range(len(sentences))
-        ]
+            marked_contexts = []
+        else:
+            marked_contexts = [
+                build_marked_context_window(
+                    sentences=sentences,
+                    target_index=idx,
+                    marker_start=self.encoder.config.marker_start,
+                    marker_end=self.encoder.config.marker_end,
+                    max_chars=self.window_max_chars,
+                )
+                for idx in range(len(sentences))
+            ]
 
-        semantic_similarities, sent_embs = self.encoder.score_sentences(
-            question=question,
-            sentences=sentences,
-            marked_contexts=marked_contexts,
-        )
+            semantic_similarities, sent_embs = self.encoder.score_sentences(
+                question=question,
+                sentences=sentences,
+                marked_contexts=marked_contexts,
+            )
         attention_scores = (
             self.encoder.attention_probe_scores(
                 question=question,

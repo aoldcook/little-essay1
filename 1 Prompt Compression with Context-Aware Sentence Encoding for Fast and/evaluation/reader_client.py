@@ -50,12 +50,26 @@ class ReaderConfig:
     max_retries: int = 5
     retry_base_delay: float = 1.5
 
+    # Provider-agnostic: the reader is any OpenAI-compatible endpoint. Generic
+    # READER_* names win; the DASHSCOPE_* names remain as fallbacks so existing
+    # .env files keep working, and DEEPSEEK_* is recognised for convenience.
+    BASE_URL_ENV = ("READER_BASE_URL", "DASHSCOPE_BASE_URL", "DEEPSEEK_BASE_URL")
+    API_KEY_ENV = ("READER_API_KEY", "DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY")
+
+    @staticmethod
+    def _first_env(names) -> str:
+        for name in names:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return value
+        return ""
+
     @classmethod
     def from_env(cls, **overrides) -> "ReaderConfig":
         load_env()
         config = cls(
             model=os.environ.get("READER_MODEL") or DEFAULT_MODEL,
-            base_url=os.environ.get("DASHSCOPE_BASE_URL") or DEFAULT_BASE_URL,
+            base_url=cls._first_env(cls.BASE_URL_ENV) or DEFAULT_BASE_URL,
         )
         for key, value in overrides.items():
             if value is not None and hasattr(config, key):
@@ -104,12 +118,18 @@ class QwenReader:
         self.config = config or ReaderConfig.from_env()
         self.stats = ReaderStats()
 
-        api_key = require_env(
-            "DASHSCOPE_API_KEY",
-            hint=(
-                "Get a key from https://bailian.console.aliyun.com/ and put it in "
-                ".env as DASHSCOPE_API_KEY=... (see .env.example)."
-            ),
+        api_key = ReaderConfig._first_env(ReaderConfig.API_KEY_ENV)
+        if not api_key:
+            raise ReaderError(
+                "No reader API key found. Set one of "
+                f"{', '.join(ReaderConfig.API_KEY_ENV)} in .env or the environment.\n"
+                "The key is never logged, never written to a results file, and never "
+                "accepted as a CLI argument; the manifest records only that it was present."
+            )
+        # Which variable supplied it -- the NAME only, never the value. Lets a
+        # manifest show which provider a result came from.
+        self.api_key_env = next(
+            (n for n in ReaderConfig.API_KEY_ENV if os.environ.get(n, "").strip()), None
         )
         try:
             from openai import OpenAI

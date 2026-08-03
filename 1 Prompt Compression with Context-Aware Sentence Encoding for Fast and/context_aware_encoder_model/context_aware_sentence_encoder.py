@@ -254,6 +254,93 @@ class ContextAwareSentenceEncoder(nn.Module):
         return sims.detach().cpu().tolist(), s_emb.detach().cpu()
 
     @torch.no_grad()
+    def score_sentences_single_pass(
+        self,
+        question: str,
+        context: str,
+        sentence_spans: Sequence[Tuple[int, int]],
+    ) -> Tuple[List[float], torch.Tensor]:
+        """Score every sentence from ONE encoder pass over the whole context.
+
+        The marked-window path runs one forward pass per sentence over a ~900
+        character window, so a context with N sentences costs roughly N * 250
+        token-positions. Encoding the context once and mean-pooling each
+        sentence's token span costs about L token-positions instead -- ~12x less
+        for a 100-sentence context -- and conditions each sentence on the FULL
+        context rather than a fixed-width neighbourhood.
+
+        Contexts longer than the model's window are processed in overlapping
+        chunks; a sentence straddling a boundary accumulates from both.
+        """
+        self.eval()
+        if not sentence_spans:
+            return [], torch.empty((0, 0))
+
+        encoding = self.tokenizer(
+            context,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+            return_tensors=None,
+        )
+        input_ids = encoding["input_ids"]
+        offsets = encoding["offset_mapping"]
+        if not input_ids:
+            return [0.0 for _ in sentence_spans], torch.zeros((len(sentence_spans), 1))
+
+        window = max(16, int(self.config.max_length) - 2)
+        stride = max(1, window // 2)  # 50% overlap so boundary sentences are seen whole
+
+        hidden_size = int(getattr(self.encoder.config, "hidden_size", 384))
+        sums = torch.zeros((len(sentence_spans), hidden_size), device=self.device)
+        counts = torch.zeros(len(sentence_spans), device=self.device)
+
+        starts = list(range(0, len(input_ids), stride))
+        for chunk_start in starts:
+            chunk_ids = input_ids[chunk_start: chunk_start + window]
+            if not chunk_ids:
+                continue
+            chunk_offsets = offsets[chunk_start: chunk_start + window]
+            try:
+                wrapped = self.tokenizer.build_inputs_with_special_tokens(list(chunk_ids))
+            except Exception:
+                wrapped = list(chunk_ids)
+            # Locate the chunk inside the wrapped sequence rather than assuming
+            # how many special tokens the tokenizer prepends.
+            lead = 0
+            if len(wrapped) > len(chunk_ids):
+                for offset in range(len(wrapped) - len(chunk_ids) + 1):
+                    if wrapped[offset: offset + len(chunk_ids)] == list(chunk_ids):
+                        lead = offset
+                        break
+            ids_tensor = torch.tensor([wrapped], dtype=torch.long, device=self.device)
+            mask_tensor = torch.ones_like(ids_tensor)
+            hidden = self.encoder(
+                input_ids=ids_tensor, attention_mask=mask_tensor
+            ).last_hidden_state[0]
+            hidden = hidden[lead: lead + len(chunk_ids)]
+            if hidden.size(0) != len(chunk_ids):
+                continue
+
+            for sent_idx, (span_start, span_end) in enumerate(sentence_spans):
+                positions = [
+                    i for i, (a, b) in enumerate(chunk_offsets)
+                    if b > a and a >= span_start and b <= span_end
+                ]
+                if not positions:
+                    continue
+                sums[sent_idx] += hidden[positions].sum(dim=0)
+                counts[sent_idx] += len(positions)
+            if chunk_start + window >= len(input_ids):
+                break
+
+        counts = torch.clamp(counts, min=1.0).unsqueeze(-1)
+        sent_emb = F.normalize(sums / counts, p=2, dim=1)
+
+        q_emb = self.encode_question([question])
+        sims = torch.matmul(q_emb, sent_emb.T).squeeze(0)
+        return sims.detach().cpu().tolist(), sent_emb.detach().cpu()
+
+    @torch.no_grad()
     def attention_probe_scores(
         self,
         question: str,
