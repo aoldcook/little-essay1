@@ -42,6 +42,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from evaluation.qa_metrics import aggregate, evidence_recall, score_prediction
 from evaluation.reader_client import QwenReader, ReaderConfig
+from evaluation.run_coverage_profile import profile_row
 from evaluation.run_downstream_eval import gold_answers, gold_evidence, load_jsonl
 from pipeline.compression_pipeline import ContextAwareCompressor, estimate_token_count
 from pipeline.runtime_contract import (
@@ -157,10 +158,19 @@ def run_arm(name: str, compressor, rows, ratio: float, batch_reader) -> Dict[str
             "id": row.get("id"),
             "dataset": row.get("dataset"),
             "achieved_ratio": kept / max(original, 1),
+            "actual_cr": 100.0 * kept / max(original, 1),
             "compression_x": original / max(kept, 1),
             "compress_latency_s": latency,
             "evidence_recall": evidence_recall(gold_evidence(row), compressed),
+            # Stored so new metrics can be computed later without recompressing.
+            "compressed_context": compressed,
         }
+        # Lexical coverage columns (Ans Cov / Support Cov / Hard Fact / QA Ans
+        # Rate). No model is involved: these measure token survival, not reader
+        # comprehension. Reported beside EM/F1 so the two can be compared.
+        record.update(
+            {k: (None if v is None else 100.0 * v) for k, v in profile_row(row, compressed).items()}
+        )
         per_row.append(record)
         pending.append((record, question, compressed, gold_answers(row)))
 
@@ -176,14 +186,22 @@ def run_arm(name: str, compressor, rows, ratio: float, batch_reader) -> Dict[str
                 record["em"] = record["f1"] = record["rouge_l"] = None
 
     keys = ["em", "f1", "rouge_l", "evidence_recall", "achieved_ratio",
+            "actual_cr", "ans_cov", "support_cov", "hard_fact", "qa_ans_rate",
             "compression_x", "compress_latency_s"]
+    summary = aggregate(per_row, keys)
+
+    parts = [summary.get(k) for k in ("ans_cov", "support_cov", "hard_fact", "qa_ans_rate")]
+    parts = [p for p in parts if p is not None]
+    cr = summary.get("actual_cr") or 0.0
+    summary["utility_per_token"] = (sum(parts) / len(parts)) / cr if parts and cr > 0 else None
+
     return {
         "arm": name,
         "weights": {k: round(float(v), 4) for k, v in arm_kwargs(name).items() if isinstance(v, (int, float))},
         "num_rows": len(per_row),
         "scored_rows": sum(1 for r in per_row if r.get("f1") is not None),
         "reader_failures": sum(1 for r in per_row if r.get("reader_ok") is False),
-        "summary": aggregate(per_row, keys),
+        "summary": summary,
         "rows": per_row,
     }
 
@@ -236,11 +254,15 @@ def main() -> None:
         res = run_arm(name, compressor, rows, args.ratio, batch_reader)
         results.append(res)
         s = res["summary"]
+        def g(key, places=1):
+            v = s.get(key)
+            return "n/a" if v is None else f"{v:.{places}f}"
+
         print(
-            f"  {name:<16} achieved={s['achieved_ratio']:.3f} "
-            f"EM={s['em']:.3f} F1={s['f1']:.3f} evid={s['evidence_recall']:.3f} "
-            f"lat={s['compress_latency_s']:.2f}s "
-            f"scored={res['scored_rows']} fail={res['reader_failures']}",
+            f"  {name:<16} CR={g('actual_cr')} AnsCov={g('ans_cov')} "
+            f"SupCov={g('support_cov')} Hard={g('hard_fact')} QAAns={g('qa_ans_rate')} "
+            f"Util/Tok={g('utility_per_token', 3)} | EM={g('em', 3)} F1={g('f1', 3)} "
+            f"lat={g('compress_latency_s', 2)}s",
             flush=True,
         )
         del compressor
